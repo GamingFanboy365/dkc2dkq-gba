@@ -3,7 +3,11 @@
 //   snesrun ROM [options as environment variables]
 //
 // FRAMES=N        frames to run (default 600)
-// KEYS=SCRIPT     joypad 1 script (tools/common/tool_common.h)
+// KEYS=SCRIPT     joypad 1 script (tools/common/tool_common.h). Its frames
+//                 are the game's own: the Nth entry is held from the game's
+//                 Nth wait for an NMI (a SYNC line) to the next, so the
+//                 reference and the recompiled builds, whose boot and lag
+//                 frames take different times, see the same buttons
 // OUT=DIR         where pictures and dumps go (default .)
 // SHOTS=F1,F2     save the picture at these frames (shot_FFFFF.png, 256x224)
 // DUMPS=F1,F2     save WRAM (wram_FFFFF.bin), VRAM, CGRAM, OAM at these frames
@@ -32,6 +36,7 @@
 #include "../third_party/lakesnes/snes.h"
 #include "../third_party/lakesnes/cpu.h"
 #include "common/tool_common.h"
+#include "../src/sync_hash.h"
 
 // ---- tracing ----
 
@@ -81,12 +86,6 @@ static int g_num_waits, g_wait_dumps[4096], g_num_wait_dumps;
 static bool g_nmi_since_wait = true;
 static const char *g_out_dir = ".";
 
-// WRAM's hash for SYNC, less active_frame_counter ($7E002C).
-static uint32_t hash_ram(const uint8_t *p, size_t n) {
-  uint32_t h = 2166136261u;
-  for (size_t i = 0; i < n; i++) h = (h ^ (i == 0x2c || i == 0x2d ? 0 : p[i])) * 16777619u;
-  return h;
-}
 
 // Reads ROM without touching the clock (cpu->read is the timed bus access).
 static uint8_t peek_rom(uint32_t pc) {
@@ -112,7 +111,10 @@ static void trace_hook(Cpu *cpu) {
   g_prev_op = peek_rom(pc);
 }
 
-// Called for every opcode when SYNC is on: notes each WAI.
+static KeyScript g_keys;
+static void set_joypad(Snes *snes, uint16_t joy);
+
+// Called for every opcode: notes the first WAI after each NMI.
 static void sync_hook(Cpu *cpu) {
   uint32_t pc = (uint32_t)cpu->k << 16 | cpu->pc;
   uint16_t nmi_vector = snes_read(g_snes, 0xffea) | snes_read(g_snes, 0xffeb) << 8;
@@ -120,7 +122,8 @@ static void sync_hook(Cpu *cpu) {
   uint8_t op = peek_rom(pc);
   if (op == 0xCB && g_nmi_since_wait) {
     g_nmi_since_wait = false;
-    fprintf(g_sync, "%d %08x %06x\n", g_frame, hash_ram(g_snes->ram, sizeof(g_snes->ram)), pc);
+    set_joypad(g_snes, keyscript_at(&g_keys, g_num_waits));
+    if (g_sync) fprintf(g_sync, "%d %08x %06x\n", g_frame, sync_hash(g_snes->ram), pc);
     if (int_list_has(g_wait_dumps, g_num_wait_dumps, g_num_waits)) {
       char path[1024];
       snprintf(path, sizeof(path), "%s/waitwram_%d.bin", g_out_dir, g_num_waits);
@@ -205,8 +208,7 @@ int main(int argc, char **argv) {
   static int shots[4096], dumps[4096];
   int num_shots = parse_int_list(getenv("SHOTS"), shots, 4096);
   int num_dumps = parse_int_list(getenv("DUMPS"), dumps, 4096);
-  KeyScript keys;
-  if (!keyscript_parse(&keys, getenv("KEYS"))) { fprintf(stderr, "bad KEYS\n"); return 1; }
+  if (!keyscript_parse(&g_keys, getenv("KEYS"))) { fprintf(stderr, "bad KEYS\n"); return 1; }
   const char *trace_path = getenv("TRACE");
   if (getenv("SYNC")) g_sync = fopen(getenv("SYNC"), "w");
   g_num_wait_dumps = parse_int_list(getenv("WAIT_DUMPS"), g_wait_dumps, 4096);
@@ -214,12 +216,9 @@ int main(int argc, char **argv) {
 
   Snes *snes = g_snes = snes_init();
   if (!snes_loadRom(snes, rom, (int)rom_size)) { fprintf(stderr, "cannot load the ROM\n"); return 1; }
-  if (trace_path && g_sync) cpu_traceHook = both_hooks;
-  else if (trace_path) cpu_traceHook = trace_hook;
-  else if (g_sync) cpu_traceHook = sync_hook;
+  cpu_traceHook = trace_path ? both_hooks : sync_hook;
 
   for (g_frame = 0; g_frame < frames; g_frame++) {
-    set_joypad(snes, keyscript_at(&keys, g_frame));
     snes_runFrame(snes);
     if (int_list_has(shots, num_shots, g_frame)) save_shot(snes, out, g_frame);
     if (int_list_has(dumps, num_dumps, g_frame)) save_dump(snes, out, g_frame);

@@ -1,10 +1,11 @@
 // See snes_hw.h. The ports behave as LakeSnes's (third_party/lakesnes/ppu.c,
 // snes.c, dma.c, cart.c), which is what the game is checked against.
+#include "cpu65.h"   // first: the platform's HOT_CODE
 #include "snes_hw.h"
 
 #include <string.h>
 
-#include "cpu65.h"
+#include "snes_mem.h"
 
 #ifndef EWRAM_DATA
 #define EWRAM_DATA
@@ -39,6 +40,13 @@ static uint16_t serial_order(uint16_t joy) {
 
 void hw_vblank(uint16_t joy1) {
   g_hw.in_nmi = 1;
+  if (!(g_hw.regs[0x00] & 0x80)) {
+    // Unless the screen is blanked, the OAM address goes back to the one
+    // last written: the game's OAM DMA counts on it.
+    g_hw.oam_adr = g_hw.oam_adr_written;
+    g_hw.oam_in_high = g_hw.oam_in_high_written;
+    g_hw.oam_second_write = 0;
+  }
   g_hw.joy1_now = joy1;
   if (g_hw.nmitimen & 1) {
     // Auto-joypad: latch, shift 16 bits out of each port (ones shift in).
@@ -67,9 +75,34 @@ static uint16_t vram_remap(void) {
   }
 }
 
-static void ppu_write(uint8_t adr, uint8_t val) {
+void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
+
+HOT_CODE static void ppu_write(uint8_t adr, uint8_t val) {
   g_hw.regs[adr] = val;
+  if (g_ppu_write_hook) g_ppu_write_hook(adr, val);
   switch (adr) {
+    case 0x0d: case 0x0f: case 0x11: case 0x13:
+      g_hw.hofs[(adr - 0x0d) >> 1] =
+          (uint16_t)((val << 8 | (g_hw.scroll_prev & 0xf8) | (g_hw.scroll_prev2 & 7)) & 0x3ff);
+      g_hw.scroll_prev = g_hw.scroll_prev2 = val;
+      if (adr == 0x0d) {
+        g_hw.m7matrix[6] = (int16_t)((val << 8 | g_hw.m7prev) & 0x1fff);
+        g_hw.m7prev = val;
+      }
+      break;
+    case 0x0e: case 0x10: case 0x12: case 0x14:
+      g_hw.vofs[(adr - 0x0e) >> 1] = (uint16_t)((val << 8 | g_hw.scroll_prev) & 0x3ff);
+      g_hw.scroll_prev = val;
+      if (adr == 0x0e) {
+        g_hw.m7matrix[7] = (int16_t)((val << 8 | g_hw.m7prev) & 0x1fff);
+        g_hw.m7prev = val;
+      }
+      break;
+    case 0x32:
+      if (val & 0x80) g_hw.fixed_b = val & 0x1f;
+      if (val & 0x40) g_hw.fixed_g = val & 0x1f;
+      if (val & 0x20) g_hw.fixed_r = val & 0x1f;
+      break;
     case 0x02:
       g_hw.oam_adr = g_hw.oam_adr_written = val;
       g_hw.oam_in_high = g_hw.oam_in_high_written;
@@ -111,20 +144,23 @@ static void ppu_write(uint8_t adr, uint8_t val) {
     case 0x18: {
       uint16_t a = vram_remap() & 0x7fff;
       g_hw.vram[a] = (g_hw.vram[a] & 0xff00) | val;
+      g_hw.vram_dirty[a >> 8] |= 1u << ((a >> 3) & 31);
       if (!g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }
     case 0x19: {
       uint16_t a = vram_remap() & 0x7fff;
       g_hw.vram[a] = (uint16_t)((g_hw.vram[a] & 0x00ff) | val << 8);
+      g_hw.vram_dirty[a >> 8] |= 1u << ((a >> 3) & 31);
       if (g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }
-    case 0x1b: case 0x1c:
+    case 0x1b: case 0x1c: case 0x1d: case 0x1e:
       g_hw.m7matrix[adr - 0x1b] = (int16_t)(val << 8 | g_hw.m7prev);
       g_hw.m7prev = val;
       break;
-    case 0x1d: case 0x1e: case 0x1f: case 0x20:
+    case 0x1f: case 0x20:
+      g_hw.m7matrix[adr - 0x1b] = (int16_t)((val << 8 | g_hw.m7prev) & 0x1fff);
       g_hw.m7prev = val;
       break;
     case 0x21:
@@ -135,6 +171,7 @@ static void ppu_write(uint8_t adr, uint8_t val) {
       if (!g_hw.cgram_second_write) g_hw.cgram_buffer = val;
       else g_hw.cgram[g_hw.cgram_pointer++] = (uint16_t)(val << 8 | g_hw.cgram_buffer);
       g_hw.cgram_second_write ^= 1;
+      g_hw.cgram_ver++;
       break;
     default:
       break;
@@ -229,7 +266,7 @@ static void apu_update(void) {
 
 // ---- the B bus: PPU, APU ports, WRAM port ----
 
-static void bbus_write(uint8_t adr, uint8_t val) {
+HOT_CODE static void bbus_write(uint8_t adr, uint8_t val) {
   if (adr < 0x40) {
     ppu_write(adr, val);
   } else if (adr < 0x80) {
@@ -268,6 +305,89 @@ static const uint8_t kBAdrOffsets[8][4] = {
   {0, 1, 2, 3}, {0, 1, 0, 1}, {0, 0, 0, 0}, {0, 0, 1, 1},
 };
 
+// A host pointer to `len` bytes of the A bus from `addr` up, if they're all
+// plain memory (WRAM or ROM) in one piece; else NULL.
+static const uint8_t *direct_source(uint32_t addr, uint32_t len) {
+  uint8_t bank = addr >> 16;
+  uint32_t lo = addr & 0xffff;
+  if (lo + len > 0x10000) return 0;
+  if ((bank & 0xfe) == 0x7e) return &g_wram[addr & 0x1ffff];
+  if ((bank & 0x7f) < 0x40) {
+    if (lo + len <= 0x2000) return &g_wram[lo];
+    if (lo >= 0x8000) return &g_rom[(((uint32_t)(bank & 0x3f) << 16) | lo) & g_rom_mask];
+    return 0;
+  }
+  return &g_rom[(((uint32_t)(bank & 0x3f) << 16) | lo) & g_rom_mask];
+}
+
+// The common big transfer: words to VRAM ($2118/$2119, mode 1), the
+// address stepping after the high byte, no remapping. As the byte-by-byte
+// path would do it, write for write.
+HOT_CODE static bool fast_vram_dma(const uint8_t *src, bool fixed, uint32_t size) {
+  if (!g_hw.vram_increment_on_high || g_hw.vram_remap || (size & 1)) return false;
+  uint16_t ptr = g_hw.vram_pointer, inc = g_hw.vram_increment;
+  uint16_t *vram = g_hw.vram;
+  uint32_t *dirty = g_hw.vram_dirty;
+  if (fixed) {
+    // A fixed source writes its first byte to both halves.
+    uint16_t w = (uint16_t)(src[0] | src[0] << 8);
+    for (uint32_t n = size >> 1; n; n--) {
+      uint16_t a = ptr & 0x7fff;
+      vram[a] = w;
+      dirty[a >> 8] |= 1u << ((a >> 3) & 31);
+      ptr += inc;
+    }
+  } else {
+    uint32_t last_chunk = 0xffffffff;
+    for (uint32_t n = size >> 1; n; n--, src += 2) {
+      uint32_t a = ptr & 0x7fff;
+      vram[a] = (uint16_t)(src[0] | src[1] << 8);
+      if (a >> 3 != last_chunk) {
+        last_chunk = a >> 3;
+        dirty[a >> 8] |= 1u << ((a >> 3) & 31);
+      }
+      ptr += inc;
+    }
+  }
+  g_hw.vram_pointer = ptr;
+  g_hw.regs[0x18] = src[fixed ? 0 : -2];
+  g_hw.regs[0x19] = src[fixed ? 0 : -1];
+  return true;
+}
+
+// OAM ($2104) and CGRAM ($2122) uploads, mode 0: the ports' own steps
+// (ppu_write), without the per-byte dispatch.
+HOT_CODE static void fast_oam_dma(const uint8_t *src, uint32_t size) {
+  for (; size; size--) {
+    uint8_t val = *src++;
+    if (g_hw.oam_in_high) {
+      g_hw.high_oam[((g_hw.oam_adr & 0xf) << 1) | g_hw.oam_second_write] = val;
+      if (g_hw.oam_second_write) {
+        g_hw.oam_adr++;
+        if (g_hw.oam_adr == 0) g_hw.oam_in_high = 0;
+      }
+    } else if (!g_hw.oam_second_write) {
+      g_hw.oam_buffer = val;
+    } else {
+      g_hw.oam[g_hw.oam_adr++] = (uint16_t)(val << 8 | g_hw.oam_buffer);
+      if (g_hw.oam_adr == 0) g_hw.oam_in_high = 1;
+    }
+    g_hw.oam_second_write ^= 1;
+    g_hw.regs[0x04] = val;
+  }
+}
+
+HOT_CODE static void fast_cgram_dma(const uint8_t *src, uint32_t size) {
+  for (; size; size--) {
+    uint8_t val = *src++;
+    if (!g_hw.cgram_second_write) g_hw.cgram_buffer = val;
+    else g_hw.cgram[g_hw.cgram_pointer++] = (uint16_t)(val << 8 | g_hw.cgram_buffer);
+    g_hw.cgram_second_write ^= 1;
+    g_hw.regs[0x22] = val;
+    g_hw.cgram_ver++;
+  }
+}
+
 static void do_dma(uint8_t channels) {
   for (int c = 0; c < 8; c++) {
     if (!(channels & (1 << c))) continue;
@@ -278,6 +398,23 @@ static void do_dma(uint8_t channels) {
     uint32_t a_bank = (uint32_t)r[4] << 16;
     uint32_t size = r[5] | r[6] << 8;
     if (size == 0) size = 0x10000;
+    if (!from_b && !decrement && !g_ppu_write_hook) {
+      if (mode == 1 && b_adr == 0x18) {
+        const uint8_t *src = direct_source(a_bank | a_adr, fixed ? 1 : size);
+        if (src && fast_vram_dma(src, fixed, size)) {
+          if (!fixed) a_adr = (uint16_t)(a_adr + size);
+          size = 0;
+        }
+      } else if ((mode == 0 || mode == 2) && !fixed && (b_adr == 0x04 || b_adr == 0x22)) {
+        const uint8_t *src = direct_source(a_bank | a_adr, size);
+        if (src) {
+          if (b_adr == 0x04) fast_oam_dma(src, size);
+          else fast_cgram_dma(src, size);
+          a_adr = (uint16_t)(a_adr + size);
+          size = 0;
+        }
+      }
+    }
     int off = 0;
     while (size--) {
       uint8_t b = (uint8_t)(b_adr + kBAdrOffsets[mode][off++]);
@@ -289,6 +426,74 @@ static void do_dma(uint8_t channels) {
     r[2] = (uint8_t)a_adr;
     r[3] = a_adr >> 8;
     r[5] = r[6] = 0;
+  }
+}
+
+// ---- HDMA ----
+
+static const uint8_t kTransferLength[8] = {1, 2, 2, 4, 4, 4, 2, 4};
+
+void hw_hdma_begin(void) {
+  for (int c = 0; c < 8; c++) {
+    const uint8_t *r = g_hw.dma[c];
+    g_hw.hdma[c].active = (g_hw.hdmaen >> c) & 1;
+    g_hw.hdma[c].do_transfer = 0;
+    if (!g_hw.hdma[c].active) continue;
+    uint32_t bank = (uint32_t)r[4] << 16;
+    uint16_t t = r[2] | r[3] << 8;
+    g_hw.hdma[c].lines = rd8(bank | t++);
+    if (g_hw.hdma[c].lines == 0) g_hw.hdma[c].active = 0;
+    if (r[0] & 0x40) {
+      uint16_t ind = rd8(bank | t) | rd8(bank | (uint16_t)(t + 1)) << 8;
+      t += 2;
+      g_hw.hdma[c].indirect = (uint32_t)r[7] << 16 | ind;
+    }
+    g_hw.hdma[c].table = bank | t;
+    g_hw.hdma[c].do_transfer = 1;
+  }
+}
+
+HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
+  hw_hdma_begin();
+  for (int line = 0; line < 224; line++) {
+    hw_hdma_line();
+    if (after_line) after_line(line);
+  }
+}
+
+HOT_CODE void hw_hdma_line(void) {
+  for (int c = 0; c < 8; c++) {
+    if (!g_hw.hdma[c].active) continue;
+    const uint8_t *r = g_hw.dma[c];
+    bool indirect = r[0] & 0x40;
+    uint32_t bank = g_hw.hdma[c].table & 0xff0000;
+    uint16_t t = (uint16_t)g_hw.hdma[c].table;
+    if (g_hw.hdma[c].do_transfer) {
+      uint8_t mode = r[0] & 7;
+      for (int i = 0; i < kTransferLength[mode]; i++) {
+        uint8_t v;
+        if (indirect) {
+          v = rd8(g_hw.hdma[c].indirect);
+          g_hw.hdma[c].indirect = (g_hw.hdma[c].indirect & 0xff0000) | (uint16_t)(g_hw.hdma[c].indirect + 1);
+        } else {
+          v = rd8(bank | t++);
+        }
+        bbus_write((uint8_t)(r[1] + kBAdrOffsets[mode][i]), v);
+      }
+    }
+    g_hw.hdma[c].lines--;
+    g_hw.hdma[c].do_transfer = g_hw.hdma[c].lines >> 7;
+    if ((g_hw.hdma[c].lines & 0x7f) == 0) {
+      g_hw.hdma[c].lines = rd8(bank | t++);
+      if (indirect) {
+        uint16_t ind = rd8(bank | t) | rd8(bank | (uint16_t)(t + 1)) << 8;
+        t += 2;
+        g_hw.hdma[c].indirect = (uint32_t)r[7] << 16 | ind;
+      }
+      if (g_hw.hdma[c].lines == 0) g_hw.hdma[c].active = 0;
+      g_hw.hdma[c].do_transfer = 1;
+    }
+    g_hw.hdma[c].table = bank | t;
   }
 }
 
@@ -346,8 +551,9 @@ static uint8_t cpu_reg_read(uint16_t adr) {
 }
 
 // ---- the memory map (HiROM) ----
+// The common cases are inline in snes_mem.h; these do all of them.
 
-uint8_t rd8(uint32_t a) {
+HOT_CODE uint8_t rd8_slow(uint32_t a) {
   uint8_t bank = a >> 16;
   uint16_t lo = (uint16_t)a;
   uint8_t v;
@@ -367,7 +573,7 @@ uint8_t rd8(uint32_t a) {
   return g_rom[(((uint32_t)(bank & 0x3f) << 16) | lo) & g_rom_mask];
 }
 
-void wr8(uint32_t a, uint8_t v) {
+HOT_CODE void wr8_slow(uint32_t a, uint8_t v) {
   uint8_t bank = a >> 16;
   uint16_t lo = (uint16_t)a;
   if ((bank & 0xfe) == 0x7e) { g_wram[a & 0x1ffff] = v; return; }

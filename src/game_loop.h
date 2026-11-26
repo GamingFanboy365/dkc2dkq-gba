@@ -6,13 +6,15 @@
 #include <stdbool.h>
 
 // Platform hooks.
-void on_wait(uint32_t wai_pc);   // the game waits for the NMI (once per NMI)
+// The game waits for the NMI (once per NMI): one frame of its logic is done.
+// Returns the joypad for the next one.
+uint16_t on_wait(uint32_t wai_pc);
 void unknown_entry(uint32_t pc);
 
 void game_reset(void);
 // Runs the game until it waits for the NMI or the frame's time is up, then
-// starts VBlank with the joypad given and enters the NMI. False if the game
-// stopped (an unknown entry, STP).
-bool game_frame(uint16_t joy1);
+// starts VBlank and enters the NMI. False if the game stopped (an unknown
+// entry, STP).
+bool game_frame(void);
 
 #endif

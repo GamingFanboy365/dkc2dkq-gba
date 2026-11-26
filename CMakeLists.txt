@@ -18,6 +18,8 @@ project(dkc2port C ASM)
 set(DKC2_ROM "" CACHE FILEPATH "Your Donkey Kong Country 2 (USA, Rev 1) ROM")
 set(ASAR "asar" CACHE FILEPATH "asar 1.9 or later")
 option(DKC2_SYNC_LOG "GBA: print a hash of WRAM every frame, to compare with the reference" OFF)
+set(DKC2_SHOTS "" CACHE STRING "GBA: game frames (waits) N,N,.. after which to print 'shot N' (for gbarun -t)")
+set(DKC2_TEST_KEYS "" CACHE STRING "GBA: a KEYS script to play instead of the joypad (tools/common/tool_common.h)")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if(NOT DKC2_ROM AND CMAKE_SYSTEM_NAME STREQUAL "Generic")
@@ -52,16 +54,33 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   # ---- the GBA ----
   set(GBA_FLAGS -mthumb -O2 -Wall -Wno-unused-label)
-  add_executable(dkc2.elf gba/crt0.S gba/main.c gba/debug.c gba/libc.c ${PORT_SOURCES} ${GEN_SOURCES})
-  target_include_directories(dkc2.elf PRIVATE gba/include gba src src/budget ${GEN})
+  add_executable(dkc2.elf gba/crt0.S gba/main.c gba/render.c gba/debug.c gba/libc.c ${PORT_SOURCES} ${GEN_SOURCES})
+  target_include_directories(dkc2.elf PRIVATE gba/include gba src ${GEN})
   target_compile_options(dkc2.elf PRIVATE $<$<COMPILE_LANGUAGE:C>:${GBA_FLAGS}>)
   target_compile_definitions(dkc2.elf PRIVATE "EWRAM_DATA=__attribute__((section(\".ewram_bss\")))")
   if(DKC2_SYNC_LOG)
     target_compile_definitions(dkc2.elf PRIVATE SYNC_LOG)
   endif()
+  if(DKC2_SHOTS)
+    target_compile_definitions(dkc2.elf PRIVATE "SHOT_LOG=${DKC2_SHOTS}")
+  endif()
+  if(DKC2_TEST_KEYS)
+    file(WRITE ${CMAKE_BINARY_DIR}/test_keys.txt "${DKC2_TEST_KEYS}")
+    add_custom_command(
+      OUTPUT ${GEN}/test_keys.h
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/keys_to_c.py ${CMAKE_BINARY_DIR}/test_keys.txt ${GEN}/test_keys.h
+      DEPENDS ${CMAKE_BINARY_DIR}/test_keys.txt ${CMAKE_SOURCE_DIR}/tools/keys_to_c.py)
+    target_sources(dkc2.elf PRIVATE ${GEN}/test_keys.h)
+    target_compile_definitions(dkc2.elf PRIVATE TEST_KEYS)
+  endif()
   # The C library mustn't turn its own loops into calls to itself.
   set_source_files_properties(gba/libc.c PROPERTIES COMPILE_OPTIONS "-fno-builtin")
-  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+  # The recompiled code: Thumb's pc-relative ranges are too short for its
+  # biggest functions; ARM it is.
+  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-marm")
+  # What the recompiled code calls into, ARM too, so the memory map's inline
+  # functions inline everywhere (their hot parts are in IWRAM).
+  set_source_files_properties(src/snes_hw.c src/runtime.c gba/render.c PROPERTIES COMPILE_OPTIONS "-marm")
   target_link_options(dkc2.elf PRIVATE -T ${CMAKE_SOURCE_DIR}/gba/gba.ld -Wl,-Map=${CMAKE_BINARY_DIR}/dkc2.map)
   set_target_properties(dkc2.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/gba/gba.ld)
   add_custom_command(
@@ -105,5 +124,5 @@ if(DKC2_ROM)
   add_executable(hostmini host/hostmini.c ${PORT_SOURCES} $<TARGET_OBJECTS:gen_budget>)
   target_include_directories(hostmini PRIVATE src src/budget)
   target_compile_definitions(hostmini PRIVATE CHECK_ASSUMPTIONS)
-  target_link_libraries(hostmini toolcommon)
+  target_link_libraries(hostmini lakesnes toolcommon)
 endif()

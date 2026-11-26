@@ -8,25 +8,61 @@
 #include "cpu65.h"
 #include "game_loop.h"
 #include "gba_hw.h"
+#include "render.h"
 #include "snes_hw.h"
+#include "sync_hash.h"
 
 extern const uint32_t g_snes_rom_offset;   // crt0.S, set by make_cartridge.py
 
 static int g_frame;
 
-#ifdef SYNC_LOG
-static uint32_t hash_ram(const uint8_t *p, uint32_t n) {
-  uint32_t h = 2166136261u;
-  for (uint32_t i = 0; i < n; i++) h = (h ^ (i == 0x2c || i == 0x2d ? 0 : p[i])) * 16777619u;
-  return h;
-}
-#endif
 
-void on_wait(uint32_t wai_pc) {
+static uint16_t read_joypad(void);
+
+volatile uint8_t g_lag_event, g_frame_vblanks;
+
+void irq_handler(void) {
+  uint16_t flags = REG_IF;
+  if (flags & 1) {
+    render_vblank();
+    if (++g_frame_vblanks > LAG_VBLANKS) g_lag_event = 1;
+  }
+  REG_IF = flags;
+  REG_BIOS_IF |= flags;
+}
+
+#ifdef TEST_KEYS
+#include "test_keys.h"   // generated from DKC2_TEST_KEYS: g_test_keys[][2]
+#endif
+static int g_waits;
+
+uint16_t on_wait(uint32_t wai_pc) {
+  render_frame();
+#ifdef SHOT_LOG
+  // gbarun -t takes the picture in the frame after this one: keep it there.
+  static const int kShots[] = {SHOT_LOG};
+  for (unsigned i = 0; i < sizeof(kShots) / sizeof(kShots[0]); i++)
+    if (kShots[i] == g_waits) {
+      debug_printf("shot %d", g_waits);
+      render_hold(2);
+    }
+#endif
 #ifdef SYNC_LOG
-  debug_printf("sync %d %08x %06x", g_frame, hash_ram(g_wram, sizeof(g_wram)), wai_pc);
+  debug_printf("sync %d %08x %06x", g_frame, sync_hash(g_wram), wai_pc);
 #else
   (void)wai_pc;
+#endif
+#ifdef TEST_KEYS
+  // The script's frames are the game's own, as in snesrun.
+  uint32_t n = g_waits++, at = 0;
+  for (uint32_t i = 0; i < sizeof(g_test_keys) / sizeof(g_test_keys[0]); i++) {
+    at += g_test_keys[i][0];
+    if (n < at) return g_test_keys[i][1];
+  }
+  return 0;
+#else
+  g_waits++;
+  return read_joypad();
 #endif
 }
 
@@ -64,12 +100,16 @@ int main(void) {
   g_rom_mask = 0x3fffff;
   debug_printf("SNES ROM at %08x", (uint32_t)g_rom);
   cycles_start();
+  render_init();
+  REG_DISPSTAT = 1 << 3;   // VBlank interrupt
+  REG_IE = 1;
+  REG_IME = 1;
   game_reset();
   uint32_t total = 0, worst = 0;
   int in_window = 0;
   for (g_frame = 0;; g_frame++) {
     uint32_t t0 = cycles_now();
-    bool ok = game_frame(read_joypad());
+    bool ok = game_frame();
     uint32_t t = cycles_now() - t0;
     total += t;
     if (t > worst) worst = t;
@@ -78,11 +118,16 @@ int main(void) {
       for (;;) {}
     }
     if (++in_window == 60) {
-      // The mean, total / 60, by shifts (1/64 + 1/1024 + 1/16384: 0.02% low).
-      uint32_t mean = (total >> 6) + (total >> 10) + (total >> 14);
-      debug_printf("frames %d-%d: %u cycles a frame on average, %u at most (a GBA frame is 280896)",
-                   g_frame - 59, g_frame, mean, worst);
+      // Means over 60 frames, total / 60 by shifts (1/64 + 1/1024 + 1/16384:
+      // 0.02% low). The game's logic is the frame's time less drawing and
+      // waiting for VBlank.
+#define MEAN60(t) (((t) >> 6) + ((t) >> 10) + ((t) >> 14))
+      uint32_t logic = total - g_render_cycles - g_idle_cycles;
+      debug_printf("frames %d-%d: logic %u, drawing %u, idle %u cycles a frame; slowest frame %u "
+                   "(a GBA frame is 280896)", g_frame - 59, g_frame, MEAN60(logic),
+                   MEAN60(g_render_cycles), MEAN60(g_idle_cycles), worst);
       total = worst = 0;
+      g_render_cycles = g_idle_cycles = 0;
       in_window = 0;
     }
   }

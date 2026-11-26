@@ -16,9 +16,15 @@ static inline uint32_t canonical(uint32_t pc) {
   return (pc >> 16) < 0x40 ? pc | 0x800000 : pc;
 }
 
+extern const uint8_t g_entry_bank_slot[256];
+extern const uint16_t g_entry_page_start[][257];
+
 RegionFn lookup_entry(uint32_t pc) {
   uint32_t key = canonical(pc);
-  uint32_t lo = 0, hi = g_num_entries;
+  uint32_t slot = g_entry_bank_slot[key >> 16];
+  if (slot == 0xff) return 0;
+  const uint16_t *page = g_entry_page_start[slot];
+  uint32_t lo = page[(key >> 8) & 0xff], hi = page[((key >> 8) & 0xff) + 1];
   while (lo < hi) {
     uint32_t mid = (lo + hi) >> 1;
     if (g_entry_pcs[mid] < key) lo = mid + 1;
@@ -41,7 +47,7 @@ uint32_t dispatch(uint32_t pc) {
 // (the stack pointer before the return address was pushed). Returns false,
 // with where the game went in g_unwind, if it leaves the call another way:
 // a flag, or a stack popped above s0.
-static bool finish_call(uint32_t pc, uint32_t ret, uint16_t s0) {
+bool finish_call(uint32_t pc, uint32_t ret, uint16_t s0) {
   for (;;) {
     if (pc == ret && cpu.s == s0) {
       cpu.pb = ret >> 16;

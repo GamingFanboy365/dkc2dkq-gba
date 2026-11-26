@@ -39,22 +39,26 @@ typedef uint32_t (*RegionFn)(uint32_t entry);
 #define PC_FLAGS 0xff000000u
 
 // ---- platform ----
-uint8_t rd8(uint32_t addr);
-void wr8(uint32_t addr, uint8_t value);
-#include "platform_cpu.h"   // CYC(n), EVENT_PENDING(), ASSUME_FAILED(pc)
+// rd8, wr8 (the SNES's memory map), rd8_b0, wr8_b0 (bank 0), CYC(n),
+// EVENT_PENDING(), ASSUME_MX(m, x, pc).
+#include "platform_cpu.h"
 
 static inline uint16_t rd16(uint32_t a) { return rd8(a) | rd8((a + 1) & 0xffffff) << 8; }
 static inline uint32_t rd24(uint32_t a) {
   return rd8(a) | rd8((a + 1) & 0xffffff) << 8 | (uint32_t)rd8((a + 2) & 0xffffff) << 16;
 }
 static inline void wr16(uint32_t a, uint16_t v) { wr8(a, (uint8_t)v); wr8((a + 1) & 0xffffff, v >> 8); }
+// Bank 0's 16-bit accesses wrap within it.
+static inline uint16_t rd16_b0(uint16_t a) { return rd8_b0(a) | rd8_b0((uint16_t)(a + 1)) << 8; }
+static inline void wr16_b0(uint16_t a, uint16_t v) { wr8_b0(a, (uint8_t)v); wr8_b0((uint16_t)(a + 1), v >> 8); }
+static inline uint32_t rd24_b0(uint16_t a) { return rd16_b0(a) | (uint32_t)rd8_b0((uint16_t)(a + 2)) << 16; }
 
-static inline void push8(uint8_t v) { wr8(cpu.s, v); cpu.s--; }
-static inline void push16(uint16_t v) { wr8(cpu.s, v >> 8); wr8((uint16_t)(cpu.s - 1), (uint8_t)v); cpu.s -= 2; }
-static inline uint8_t pull8(void) { cpu.s++; return rd8(cpu.s); }
+static inline void push8(uint8_t v) { wr8_b0(cpu.s, v); cpu.s--; }
+static inline void push16(uint16_t v) { wr8_b0(cpu.s, v >> 8); wr8_b0((uint16_t)(cpu.s - 1), (uint8_t)v); cpu.s -= 2; }
+static inline uint8_t pull8(void) { cpu.s++; return rd8_b0(cpu.s); }
 static inline uint16_t pull16(void) {
-  uint16_t lo = rd8((uint16_t)(cpu.s + 1));
-  uint16_t hi = rd8((uint16_t)(cpu.s + 2));
+  uint16_t lo = rd8_b0((uint16_t)(cpu.s + 1));
+  uint16_t hi = rd8_b0((uint16_t)(cpu.s + 2));
   cpu.s += 2;
   return lo | hi << 8;
 }
@@ -64,6 +68,9 @@ extern uint32_t g_unwind;
 RegionFn lookup_entry(uint32_t pc);      // NULL if pc isn't a known entry
 uint32_t dispatch(uint32_t pc);
 bool call_fn(RegionFn fn, uint32_t target, uint32_t ret, uint16_t s0);
+// After a call's target returned pc: true if it's back at ret with the stack
+// at s0, by way of the dispatcher if need be (see cpu65.h's top).
+bool finish_call(uint32_t pc, uint32_t ret, uint16_t s0);
 bool call_pc(uint32_t target, uint32_t ret, uint16_t s0);
 uint32_t run_until_flag(uint32_t pc);
 uint32_t interrupt(uint16_t vector_addr, uint32_t resume_pc);

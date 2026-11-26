@@ -295,8 +295,16 @@ def infer_widths(insns, tflags, dyn):
             insns[a].assumed = True
 
 
+MAX_FUNCTION = 1500
+
+
 def make_regions(insns):
-    regions, cur, prev = [], None, None
+    """The C functions: first the disassembly's routines (its routine
+    markers, and wherever the code isn't contiguous), then merged where
+    control passes between them by a branch, a JMP or falling through (in
+    the same bank): every such transfer is then a goto, and only calls,
+    returns and jumps through pointers leave a function."""
+    routines, cur, prev = [], None, None
     for a in sorted(insns):
         i = insns[a]
         start = (cur is None or prev.next != a or (a >> 16) != (prev.addr >> 16)
@@ -304,10 +312,43 @@ def make_regions(insns):
                  or (len(cur) >= MAX_REGION and i.file == prev.file))
         if start:
             cur = []
-            regions.append(cur)
+            routines.append(cur)
         cur.append(i)
-        i.region = len(regions) - 1
+        i.region = len(routines) - 1
         prev = i
+
+    parent = list(range(len(routines)))
+    size = [len(r) for r in routines]
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i in insns.values():
+        targets = []
+        t = static_target(i)
+        if t is not None and i.mnem not in ("JSR", "JSL"):
+            targets.append(t)
+        if i.mnem not in NO_FALLTHROUGH and i.mnem not in ("JSR", "JSL", "WAI"):
+            targets.append(i.next)
+        for t in targets:
+            if t in insns and (t >> 16) == (i.addr >> 16):
+                a, b = find(i.region), find(insns[t].region)
+                if a != b and size[a] + size[b] <= MAX_FUNCTION:
+                    parent[a] = b
+                    size[b] += size[a]
+
+    groups = collections.defaultdict(list)
+    for r in range(len(routines)):
+        groups[find(r)].append(r)
+    regions = []
+    for g in sorted(groups.values(), key=lambda rs: routines[rs[0]][0].addr):
+        merged = sorted((i for r in g for i in routines[r]), key=lambda i: i.addr)
+        for i in merged:
+            i.region = len(regions)
+        regions.append(merged)
     return regions
 
 
@@ -322,18 +363,18 @@ def ea_expr(i):
     if m == "dp": return f"DP({hx(o, 2)})"
     if m == "dpx": return f"DP({hx(o, 2)} + X)"
     if m == "dpy": return f"DP({hx(o, 2)} + Y)"
-    if m == "dpi": return f"DBA(rd16(DP({hx(o, 2)})))"
-    if m == "dpix": return f"DBA(rd16(DP({hx(o, 2)} + X)))"
-    if m == "dpiy": return f"L24(DBA(rd16(DP({hx(o, 2)}))) + Y)"
-    if m == "dpil": return f"rd24(DP({hx(o, 2)}))"
-    if m == "dpily": return f"L24(rd24(DP({hx(o, 2)})) + Y)"
+    if m == "dpi": return f"DBA(rd16_b0(DP({hx(o, 2)})))"
+    if m == "dpix": return f"DBA(rd16_b0(DP({hx(o, 2)} + X)))"
+    if m == "dpiy": return f"L24(DBA(rd16_b0(DP({hx(o, 2)}))) + Y)"
+    if m == "dpil": return f"rd24_b0(DP({hx(o, 2)}))"
+    if m == "dpily": return f"L24(rd24_b0(DP({hx(o, 2)})) + Y)"
     if m == "abs": return f"DBA({hx(o)})"
     if m == "absx": return f"L24(DBA({hx(o)}) + X)"
     if m == "absy": return f"L24(DBA({hx(o)}) + Y)"
     if m == "absl": return hx(o, 6)
     if m == "abslx": return f"L24({hx(o, 6)} + X)"
     if m == "sr": return f"SR({hx(o, 2)})"
-    if m == "sriy": return f"L24(DBA(rd16(SR({hx(o, 2)}))) + Y)"
+    if m == "sriy": return f"L24(DBA(rd16_b0(SR({hx(o, 2)}))) + Y)"
     raise ValueError(m)
 
 
@@ -342,8 +383,10 @@ def emit_op(i, w):
     instruction has no width)."""
     mn, mode = i.mnem, i.mode
     imm = mode in ("immm", "immx")
-    rd = f"rd{w}" if w else None
-    wr = f"wr{w}" if w else None
+    # The direct page and the stack are in bank 0.
+    b0 = "_b0" if mode in ("dp", "dpx", "dpy", "sr") else ""
+    rd = f"rd{w}{b0}" if w else None
+    wr = f"wr{w}{b0}" if w else None
     u = f"uint{w}_t" if w else None
     nz = f"NZ{w}" if w else None
     val = hx(i.operand, 4 if w == 16 else 2) if imm else (f"{rd}({ea_expr(i)})" if w and mode not in ("imp", "acc") else None)
@@ -435,7 +478,7 @@ def emit_op(i, w):
     if mn == "PHP": return ["push8(GETP());"]
     if mn == "PLP": return ["SETP(pull8());"]
     if mn == "PEA": return [f"push16({hx(i.operand)});"]
-    if mn == "PEI": return [f"push16(rd16(DP({hx(i.operand, 2)})));"]
+    if mn == "PEI": return [f"push16(rd16_b0(DP({hx(i.operand, 2)})));"]
     if mn == "PER": return [f"push16({hx(rel_target(i) & 0xFFFF)});"]
     if mn in ("REP", "SEP"):
         v = 0 if mn == "REP" else 1
@@ -508,15 +551,23 @@ class RegionEmitter:
         return f"{{ SAVE(); return {hx(target, 6)}; }}"
 
     def emit_call(self, i, target_expr, target_static, ret16, long_call):
-        out = ["{ uint16_t s0 = cpu.s;"]
+        """JSR/JSL: push the return address and run the callee. When it comes
+        back the usual way (to the return address, the stack where it was),
+        carry on here; anything else goes to finish_call (src/runtime.c)."""
+        out = [f"{{ uint16_t s0 = cpu.s; uint32_t ret = PBA({hx(ret16)});"]
         if long_call:
-            out.append("  push8(cpu.pb);")
+            out.append("  uint8_t pb0 = cpu.pb; push8(pb0);")
         out.append(f"  push16({hx((ret16 - 1) & 0xFFFF)}); SAVE();")
         fn = self.target_ref(target_static) if target_static is not None else None
         if fn:
-            out.append(f"  if (!call_fn({fn}, {target_expr}, PBA({hx(ret16)}), s0)) return g_unwind;")
+            if long_call:
+                out.append(f"  cpu.pb = {hx(i.operand >> 16, 2)};")
+            out.append(f"  uint32_t r = {fn}({target_expr});")
+            out.append("  if (r != ret || cpu.s != s0) { if (!finish_call(r, ret, s0)) return g_unwind; }")
+            if long_call:
+                out.append("  else cpu.pb = pb0;")
         else:
-            out.append(f"  if (!call_pc({target_expr}, PBA({hx(ret16)}), s0)) return g_unwind;")
+            out.append(f"  if (!call_pc({target_expr}, ret, s0)) return g_unwind;")
         out.append("  RELOAD(); }")
         return out
 
@@ -574,10 +625,12 @@ class RegionEmitter:
         region_set = {i.addr for i in region}
         name = self.fn_name(idx)
         targets = set()
-        for i in region:
+        for k, i in enumerate(region):
             t = static_target(i)
             if t is not None and t in region_set:
                 targets.add(t)
+            if i.next in region_set and (k + 1 == len(region) or region[k + 1].addr != i.next):
+                targets.add(i.next)
         entries = [i for i in region if i.addr in self.entries]
         lines = [f"uint32_t {name}(uint32_t entry) {{", "  LOAD();", "  switch (entry & 0xffff) {"]
         for i in entries:
@@ -613,9 +666,14 @@ class RegionEmitter:
             lines.append(f"  CYC({cyc});")
             lines += ["  " + b for b in body]
             falls = i.mnem not in NO_FALLTHROUGH and i.mnem != "WAI" and i.mnem not in ("STP", "BRK", "COP")
-            last = k == len(region) - 1
-            if falls and last:
-                lines.append(f"  SAVE(); return PBA({hx(i.next & 0xFFFF)});")
+            emitted_next = region[k + 1].addr if k + 1 < len(region) else None
+            if falls and emitted_next != i.next:
+                # The next instruction isn't emitted next: it's elsewhere in
+                # this function (a goto), or in another one.
+                if i.next in region_set:
+                    lines.append(f"  goto L_{i.next:06x};")
+                else:
+                    lines.append(f"  SAVE(); return PBA({hx(i.next & 0xFFFF)});")
         lines.append("}")
         return lines
 
@@ -703,6 +761,25 @@ def main():
         for k in range(0, len(es), 4):
             out.write("  " + ", ".join(em.fn_name(insns[e].region) for e in es[k:k + 4]) + ",\n")
         out.write("};\n")
+        # A page index: for each code bank, where each 256-byte page's
+        # entries start in the sorted table, so a lookup searches only the
+        # few entries of one page.
+        banks = sorted(set(e >> 16 for e in es))
+        bank_slot = [0xFF] * 256
+        for k, b in enumerate(banks):
+            bank_slot[b] = k
+        out.write("const uint8_t g_entry_bank_slot[256] = {\n")
+        for k in range(0, 256, 16):
+            out.write("  " + ", ".join(str(v) for v in bank_slot[k:k + 16]) + ",\n")
+        out.write("};\n")
+        out.write(f"const uint16_t g_entry_page_start[{len(banks)}][257] = {{\n")
+        import bisect
+        for b in banks:
+            starts = [bisect.bisect_left(es, (b << 16) | (pg << 8)) for pg in range(257)]
+            out.write("  {" + ", ".join(str(v) for v in starts) + "},\n")
+        out.write("};\n")
+        if len(es) > 0xFFFF:
+            raise SystemExit("too many entries for the page index")
     with open(os.path.join(args.out, "sources.txt"), "w") as out:
         out.write("\n".join(sources + ["entries.c"]) + "\n")
 

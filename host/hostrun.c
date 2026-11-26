@@ -20,6 +20,7 @@
 #include "../third_party/lakesnes/dma.h"
 #include "../tools/common/tool_common.h"
 #include "cpu65.h"
+#include "sync_hash.h"
 
 uint64_t g_cpu_cycles, g_event_at;
 static Snes *hw;
@@ -33,11 +34,6 @@ static bool g_stop;
 static int g_num_waits, g_wait_dumps[4096], g_num_wait_dumps;
 static bool g_nmi_since_wait = true;
 
-static uint32_t hash_ram(const uint8_t *p, size_t n) {
-  uint32_t h = 2166136261u;
-  for (size_t i = 0; i < n; i++) h = (h ^ (i == 0x2c || i == 0x2d ? 0 : p[i])) * 16777619u;
-  return h;
-}
 
 static void set_joypad(uint16_t joy) {
   uint16_t serial = 0;
@@ -73,7 +69,6 @@ static void on_frame_end(void) {
   if (int_list_has(g_dumps, g_num_dumps, g_frame)) save_dump(g_frame);
   g_frame++;
   if (g_frame >= g_frames) g_stop = true;
-  set_joypad(keyscript_at(&g_keys, g_frame));
 }
 
 // Runs the hardware up to the CPU's clock.
@@ -168,10 +163,11 @@ int main(int argc, char **argv) {
     uint32_t resume = r & 0xffffff;
     if (r & PC_YIELD) {
       yields++;
-      if (g_sync && g_nmi_since_wait) {
+      if (g_nmi_since_wait) {
         g_nmi_since_wait = false;
+        set_joypad(keyscript_at(&g_keys, g_num_waits));
         // The WAI is the instruction before the resume address.
-        fprintf(g_sync, "%d %08x %06x\n", g_frame, hash_ram(hw->ram, sizeof(hw->ram)),
+        if (g_sync) fprintf(g_sync, "%d %08x %06x\n", g_frame, sync_hash(hw->ram),
                 (resume & 0xff0000) | ((resume - 1) & 0xffff));
         if (int_list_has(g_wait_dumps, g_num_wait_dumps, g_num_waits)) {
           char path[1024];
