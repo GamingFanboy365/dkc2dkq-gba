@@ -84,12 +84,18 @@ static void ppu_write(uint8_t adr, uint8_t val) {
       g_hw.hofs[(adr - 0x0d) >> 1] =
           (uint16_t)((val << 8 | (g_hw.scroll_prev & 0xf8) | (g_hw.scroll_prev2 & 7)) & 0x3ff);
       g_hw.scroll_prev = g_hw.scroll_prev2 = val;
-      if (adr == 0x0d) g_hw.m7prev = val;
+      if (adr == 0x0d) {
+        g_hw.m7matrix[6] = (int16_t)((val << 8 | g_hw.m7prev) & 0x1fff);
+        g_hw.m7prev = val;
+      }
       break;
     case 0x0e: case 0x10: case 0x12: case 0x14:
       g_hw.vofs[(adr - 0x0e) >> 1] = (uint16_t)((val << 8 | g_hw.scroll_prev) & 0x3ff);
       g_hw.scroll_prev = val;
-      if (adr == 0x0e) g_hw.m7prev = val;
+      if (adr == 0x0e) {
+        g_hw.m7matrix[7] = (int16_t)((val << 8 | g_hw.m7prev) & 0x1fff);
+        g_hw.m7prev = val;
+      }
       break;
     case 0x32:
       if (val & 0x80) g_hw.fixed_b = val & 0x1f;
@@ -146,11 +152,12 @@ static void ppu_write(uint8_t adr, uint8_t val) {
       if (g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }
-    case 0x1b: case 0x1c:
+    case 0x1b: case 0x1c: case 0x1d: case 0x1e:
       g_hw.m7matrix[adr - 0x1b] = (int16_t)(val << 8 | g_hw.m7prev);
       g_hw.m7prev = val;
       break;
-    case 0x1d: case 0x1e: case 0x1f: case 0x20:
+    case 0x1f: case 0x20:
+      g_hw.m7matrix[adr - 0x1b] = (int16_t)((val << 8 | g_hw.m7prev) & 0x1fff);
       g_hw.m7prev = val;
       break;
     case 0x21:

@@ -54,6 +54,14 @@ static void ref_load_state(void) {
     ppu_write(ppu, (uint8_t)(0x0e + i * 2), g_hw.vofs[i] >> 8);
   }
   ppu_write(ppu, 0x1a, g_hw.regs[0x1a]);
+  for (int i = 0; i < 6; i++) {
+    ppu_write(ppu, (uint8_t)(0x1b + i), (uint8_t)g_hw.m7matrix[i]);
+    ppu_write(ppu, (uint8_t)(0x1b + i), (uint8_t)(g_hw.m7matrix[i] >> 8));
+  }
+  // Mode 7's scroll shares $210D/$210E with BG1's; set it last.
+  ppu->m7matrix[6] = g_hw.m7matrix[6];
+  ppu->m7matrix[7] = g_hw.m7matrix[7];
+  ppu->m7prev = g_hw.m7prev;
   ppu_write(ppu, 0x32, 0x20 | g_hw.fixed_r);
   ppu_write(ppu, 0x32, 0x40 | g_hw.fixed_g);
   ppu_write(ppu, 0x32, 0x80 | g_hw.fixed_b);
@@ -70,6 +78,13 @@ static void run_display(bool draw) {
     g_ppu_write_hook = ref_write;
     ppu_handleFrameStart(g_ref->ppu);
   }
+  // The SNES draws a frame while the game's logic runs, and the logic
+  // rewrites some HDMA tables in WRAM (the clouds' and the sea's scroll in
+  // Pirate Panic) as it goes, so lines drawn before the rewrite use the old
+  // values. This draws every line from the tables as the logic left them:
+  // where the rewrite came partway down the SNES's screen, some lines differ
+  // by the scroll's change of a frame (a pixel). Matching it would take the
+  // logic's timing to the scanline.
   hw_hdma_begin();
   for (int line = 0; line < 224; line++) {
     hw_hdma_line();

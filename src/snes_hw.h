@@ -32,7 +32,7 @@ typedef struct {
   uint8_t vram_remap, vram_increment_on_high;
   uint8_t oam_adr, oam_adr_written, oam_in_high, oam_in_high_written, oam_second_write, oam_buffer;
   uint8_t cgram_pointer, cgram_second_write, cgram_buffer;
-  int16_t m7matrix[2];
+  int16_t m7matrix[8];       // A, B, C, D, X, Y, HOFS, VOFS ($211B-$2120, $210D/E)
   uint8_t m7prev;
   // Decoded registers (the write-twice ones, and COLDATA's three channels)
   uint16_t hofs[4], vofs[4];
