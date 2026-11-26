@@ -132,6 +132,7 @@ static int g_shown;                    // the frame on screen
 
 static uint32_t g_expand[256];          // a bitplane byte -> a bit in each pixel's nibble
 static uint8_t g_reverse8[256];
+static uint8_t g_odd4[256];             // a bitplane byte's pixels 1, 3, 5, 7 (bits 6, 4, 2, 0) -> 4 bits
 
 // The order a pool takes free slots in: segments of slots counting up
 // (step 1) or down (-1) from `first`. Each fills from its own end toward
@@ -158,11 +159,16 @@ static inline uint32_t slots_per_tile(const Pool *p) { return p->shift == 5 ? 2 
 // Per slot: the pool and SNES tile it holds ((id << 13 | tile) + 1, or 0),
 // and the map cells showing it.
 EWRAM_DATA static uint16_t g_owner[NUM_SLOTS], g_refs[NUM_SLOTS];
-EWRAM_DATA static uint16_t g_slot_of[3][4096];
-static Pool g_pools[3] = {
+EWRAM_DATA static uint16_t g_slot_of[3][4096], g_slot_of_hires[2048];
+// The fourth: BG1's tiles in Mode 5 (hires_tile), on BG1's char base,
+// from its far end.
+#define NUM_POOLS 4
+#define HIRES_POOL 3
+static Pool g_pools[NUM_POOLS] = {
   {g_slot_of[0], {{0, 1024, 1}, {0, 0, 1}}, 0, 0, 0, 4, 0},
   {g_slot_of[1], {{1024, 512, 1}, {1023, 512, -1}}, 0, 512, 1, 4, 0},
   {g_slot_of[2], {{1536, 254, 1}, {1535, 512, -1}}, 0, 1024, 2, 3, 0},
+  {g_slot_of_hires, {{1023, 1024, -1}, {0, 0, 1}}, 0, 0, 3, 4, 0},
 };
 
 static inline uint32_t order_len(const Pool *p) { return (uint32_t)(p->seg[0].count + p->seg[1].count); }
@@ -189,7 +195,17 @@ IWRAM_CODE static void convert_tile(const Pool *p, uint32_t tile, uint32_t slot)
   volatile uint32_t *dst = (volatile uint32_t *)(BG_VRAM + slot * 32);
   const uint16_t *src = &g_hw.vram[(tile << p->shift) & 0x7fff];
   const uint32_t *ex = g_expand;
-  if (p->shift == 4) {
+  if (p->id == HIRES_POOL) {
+    // Mode 5: a 16-pixel tile, `tile` and the next; the main screen's
+    // pixels, the odd ones, make the GBA's 8.
+    const uint16_t *src2 = &g_hw.vram[((tile + 1) << 4) & 0x7fff];
+    for (int r = 0; r < 8; r++) {
+      uint32_t a = src[r], b = src[(r + 8) & 0x7fff], c = src2[r], d = src2[(r + 8) & 0x7fff];
+      uint32_t p0 = g_odd4[a & 0xff] << 4 | g_odd4[c & 0xff], p1 = g_odd4[a >> 8] << 4 | g_odd4[c >> 8];
+      uint32_t p2 = g_odd4[b & 0xff] << 4 | g_odd4[d & 0xff], p3 = g_odd4[b >> 8] << 4 | g_odd4[d >> 8];
+      dst[r] = ex[p0] | ex[p1] << 1 | ex[p2] << 2 | ex[p3] << 3;
+    }
+  } else if (p->shift == 4) {
     for (int r = 0; r < 8; r++) {
       uint32_t a = src[r], b = src[(r + 8) & 0x7fff];
       dst[r] = ex[a & 0xff] | ex[a >> 8] << 1 | ex[b & 0xff] << 2 | ex[b >> 8] << 3;
@@ -275,7 +291,7 @@ static inline void release(Pool *p, uint32_t index) {
   uint32_t per = slots_per_tile(p), first = index * per + p->index_base;
   for (uint32_t slot = first; slot < first + per; slot++) {
     if (slot >= NUM_SLOTS || !g_refs[slot] || --g_refs[slot]) continue;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < NUM_POOLS; i++) {
       int pos = place_of(&g_pools[i], slot);
       if (pos >= 0 && pos < g_pools[i].hint) g_pools[i].hint = (uint16_t)pos;
     }
@@ -329,10 +345,16 @@ static void flush_pool(Pool *p) {
 // scrolling, the column or row coming into view.
 
 #define NO_KEY 0xffffffffu
-EWRAM_DATA static uint32_t g_cell_key[3][1024];
+// A cell's key is the SNES map entry it shows: its picture depends on that
+// (and the BG's setup) alone. Its hires bit: drawn from a Mode 5 line.
+#define NO_CELL 0xffff
+EWRAM_DATA static uint16_t g_cell_key[3][1024];
+static uint32_t g_cell_hires[3][32];
+
+static inline bool cell_hires(int b, int i) { return (g_cell_hires[b][i >> 5] >> (i & 31)) & 1; }
 static uint32_t g_bg_setup[3];          // what the cells were drawn for: map, size, chr, bpp
 static uint32_t g_visible_rows[3];       // GBA map rows shown this frame (bits)
-static uint8_t g_row_col0[3][32];        // the first GBA column shown in each
+static uint8_t g_row_col0[3][32];        // the first GBA column shown in each (0xff: all)
 
 static uint16_t g_hofs[3][224], g_vofs[3][224];
 static uint16_t g_fixed_line[224];
@@ -343,7 +365,7 @@ static uint16_t g_fixed_line[224];
 // the hook sees a write before it's made).
 static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
 static uint8_t g_hdma_color[MAX_LINE_COLORS], g_num_hdma_colors;
-static uint16_t g_line_color[224][MAX_LINE_COLORS];
+EWRAM_DATA static uint16_t g_line_color[224][MAX_LINE_COLORS];
 static int g_hdma_line;
 
 static void hdma_write_hook(uint8_t reg, uint8_t value) {
@@ -401,13 +423,13 @@ static int gba_entries(int c, uint16_t *out) {
 }
 
 static Pool *bg_pool(int b) { return &g_pools[b]; }
+static Pool *cell_pool(int b, int i) { return cell_hires(b, i) ? &g_pools[HIRES_POOL] : &g_pools[b]; }
 
 static void clear_cells(int b) {
   volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
-  Pool *pool = bg_pool(b);
   for (int i = 0; i < 1024; i++) {
-    if (g_cell_key[b][i] != NO_KEY) release(pool, map[i] & 0x3ff);
-    g_cell_key[b][i] = NO_KEY;
+    if (g_cell_key[b][i] != NO_CELL) release(cell_pool(b, i), map[i] & 0x3ff);
+    g_cell_key[b][i] = NO_CELL;
     map[i] = 0;
   }
 }
@@ -416,15 +438,14 @@ static void clear_cells(int b) {
 static void evict_hidden(void) {
   for (int b = 0; b < 3; b++) {
     volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
-    Pool *pool = bg_pool(b);
     for (int row = 0; row < 32; row++) {
       bool shown = (g_visible_rows[b] >> row) & 1;
       for (int col = 0; col < 32; col++) {
         int i = row * 32 + col;
-        if (g_cell_key[b][i] == NO_KEY) continue;
-        if (shown && ((col - g_row_col0[b][row]) & 31) < 31) continue;
-        release(pool, map[i] & 0x3ff);
-        g_cell_key[b][i] = NO_KEY;
+        if (g_cell_key[b][i] == NO_CELL) continue;
+        if (shown && (g_row_col0[b][row] == 0xff || ((col - g_row_col0[b][row]) & 31) < 31)) continue;
+        release(cell_pool(b, i), map[i] & 0x3ff);
+        g_cell_key[b][i] = NO_CELL;
       }
     }
   }
@@ -440,18 +461,23 @@ static uint16_t scale_color(uint16_t c, int b) {
 
 IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wide, uint32_t chr,
                                 uint32_t words_per_tile, uint16_t pal_add, volatile uint16_t *dst_row,
-                                uint32_t *keys, Pool *pool, uint32_t need_priority) {
+                                uint16_t *keys, uint32_t *hires_bits, Pool *pool, bool hires,
+                                uint32_t need_priority) {
   const uint16_t *vram = g_hw.vram;
   uint32_t col_mask = wide ? 63 : 31;
-  for (int k = 0; k < 31; k++) {
+  Pool *other = hires ? &g_pools[b] : &g_pools[HIRES_POOL];
+  int ncols = wide ? 31 : 32;
+  if (!wide) col0 = 0;
+  for (int k = 0; k < ncols; k++) {
     uint32_t col = (col0 + k) & col_mask;
     uint32_t addr = (row_base + (col & 31) + ((col & 32) << 5)) & 0x7fff;
     uint32_t e = vram[addr];
-    uint32_t key = addr << 16 | e;
     uint32_t cell = col & 31;
-    if (keys[cell] == key) continue;
-    if (keys[cell] != NO_KEY) release(pool, dst_row[cell] & 0x3ff);
-    keys[cell] = key;
+    bool was_hires = (*hires_bits >> cell) & 1;
+    if (keys[cell] == e && was_hires == hires) continue;
+    if (keys[cell] != NO_CELL) release(was_hires == hires ? pool : other, dst_row[cell] & 0x3ff);
+    keys[cell] = (uint16_t)e;
+    *hires_bits = (*hires_bits & ~(1u << cell)) | (uint32_t)hires << cell;
     if ((e & need_priority) != need_priority) {
       // A tile this layer doesn't show (see draw_bg).
       dst_row[cell] = (uint16_t)(EMPTY_SLOT - pool->index_base);
@@ -463,6 +489,9 @@ IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wi
   }
 }
 
+#ifdef RENDER_DEBUG
+static uint32_t g_dbg_search, g_dbg_rows[3];
+#endif
 __attribute__((noinline)) static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
   uint8_t sc = g_hw.regs[0x07 + b];
   uint32_t map_base = (uint32_t)(sc & 0xfc) << 8;     // words
@@ -504,14 +533,30 @@ __attribute__((noinline)) static void draw_bg(int b, int bpp, bool main_screen, 
     natural |= 1u << (((sy + g_vofs[b][sy] + 1) >> 3) & 31);
   }
   g_visible_rows[b] = 0;
+  int last_row = -1, last_window = -1, last_g = 0;
   for (int gy = 0; gy < LINES; gy++) {
     int sy = g_src_line[gy];
     uint32_t hofs = g_hofs[b][sy], vofs = g_vofs[b][sy];
     uint32_t bgy = sy + vofs + 1;
     uint32_t row = (bgy >> 3) & row_mask;
     uint32_t col0 = (hofs + CROP_X) >> 3;
-    uint8_t window = (uint8_t)(col0 & col_mask);
+    // BG1 on a Mode 5 line: its 16-pixel tiles, halved (the HIRES_POOL).
+    bool hires = b == 0 && bpp == 4 && (g_line_mode[sy] & 7) == 5;
+    // A map 32 tiles wide fits a GBA row whole: any scroll shows it (one
+    // window); a wider one, the 31 columns from col0.
+    uint8_t window = (uint8_t)((wide ? col0 & col_mask : 0) | (uint32_t)hires << 7);
+    if ((int)row == last_row && window == last_window) {
+      // As the line before: the same GBA row.
+      f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
+      f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((last_g * 8 + (bgy & 7) - gy) & 0x1ff);
+      continue;
+    }
+    last_row = (int)row;
+    last_window = window;
     int g = row & 31;
+#ifdef RENDER_DEBUG
+    g_dbg_search++;
+#endif
     if (row_of[g] >= 0 && (row_of[g] != (int)row || window_of[g] != window)) {
       // This GBA row shows something else: another row already drawn for
       // these lines' window, or a spare one.
@@ -526,11 +571,15 @@ __attribute__((noinline)) static void draw_bg(int b, int bpp, bool main_screen, 
       row_of[g] = (int16_t)row;
       window_of[g] = window;
       g_visible_rows[b] |= 1u << g;
-      g_row_col0[b][g] = (uint8_t)(col0 & 31);
+      g_row_col0[b][g] = wide ? (uint8_t)(col0 & 31) : 0xff;   // 0xff: the whole row
       uint32_t row_base = map_base + (row & 31) * 32 + ((row & 32) ? (wide ? 0x800 : 0x400) : 0);
-      draw_row(b, row_base, col0, wide, chr, words_per_tile, pal_add, map + g * 32,
-               g_cell_key[b] + g * 32, pool, need_priority);
+#ifdef RENDER_DEBUG
+      g_dbg_rows[b]++;
+#endif
+      draw_row(b, row_base, col0, wide, chr, words_per_tile, pal_add, map + g * 32, g_cell_key[b] + g * 32,
+               &g_cell_hires[b][g], hires ? &g_pools[HIRES_POOL] : pool, hires, need_priority);
     }
+    last_g = g;
     f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
     f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((g * 8 + (bgy & 7) - gy) & 0x1ff);
   }
@@ -570,9 +619,15 @@ IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap, bool o
       uint32_t chunk = w * 32 + k;                // 8 words
       bool new_4bpp = chunk >> 1 != last_4bpp, new_8bpp = chunk >> 2 != last_4bpp >> 1;
       last_4bpp = chunk >> 1;
-      for (int i = 0; i < 3; i++) {
+      for (int i = 0; i < NUM_POOLS; i++) {
         Pool *p = &g_pools[i];
-        if (p->shift == 3) tile_changed(p, chunk);                  // a 2bpp tile
+        if (i == HIRES_POOL) {
+          // A 16-pixel tile is this tile and the next.
+          if (new_4bpp) {
+            tile_changed(p, chunk >> 1);
+            tile_changed(p, ((chunk >> 1) - 1) & 0x7ff);
+          }
+        } else if (p->shift == 3) tile_changed(p, chunk);                  // a 2bpp tile
         else if (p->shift == 4 && new_4bpp) tile_changed(p, chunk >> 1);   // a 4bpp tile
         else if (p->shift == 5 && new_8bpp) tile_changed(p, chunk >> 2);   // an 8bpp tile
       }
@@ -683,7 +738,7 @@ IWRAM_CODE static void make_obj_picture(volatile uint32_t *dst, uint32_t t, int 
 }
 
 IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, uint32_t gap, uint8_t obsel) {
-  static ObjPicture made[128];
+  EWRAM_DATA static ObjPicture made[128];
   int num_made = 0;
   uint32_t next = 0;
   int top = g_view_top, bottom = g_view_top + g_view_lines;
@@ -794,6 +849,7 @@ void render_init(void) {
     uint32_t r = 0;
     for (int i = 0; i < 8; i++) r |= (uint32_t)((b >> i) & 1) << (7 - i);
     g_reverse8[b] = (uint8_t)r;
+    g_odd4[b] = (uint8_t)((b >> 3 & 8) | (b >> 2 & 4) | (b >> 1 & 2) | (b & 1));
   }
   for (int b = 0; b < 256; b++) {
     uint32_t e = 0;
@@ -807,7 +863,7 @@ void render_init(void) {
   g_frames[0].palette_key = g_frames[1].palette_key = NO_KEY;
   g_frames[0].scroll_dest = g_frames[1].scroll_dest = 0x04000010;
   for (int b = 0; b < 3; b++) {
-    for (int i = 0; i < 1024; i++) g_cell_key[b][i] = NO_KEY;
+    for (int i = 0; i < 1024; i++) g_cell_key[b][i] = NO_CELL;
     g_bg_setup[b] = NO_KEY;
   }
   // The fixed color's plane: a tile of color 15, everywhere, in palette 15
@@ -853,6 +909,7 @@ IWRAM_CODE void render_frame(void) {
         g_bg_setup[b] = NO_KEY;
         flush_pool(&g_pools[b]);
       }
+      flush_pool(&g_pools[HIRES_POOL]);
       g_m7_shown = true;
       m7_changed = true;
     }
@@ -1070,7 +1127,12 @@ IWRAM_CODE void render_frame(void) {
       if (f->scroll[gy + 1][k] != f->scroll[1][k]) { f->per_line_scroll = true; break; }
 
 #ifdef RENDER_DEBUG
-  static uint32_t full[3];
+  static uint32_t full[3], dbg_n;
+  if (++dbg_n % 60 == 0) {
+    debug_printf("per frame: %u row lookups, rows drawn %u %u %u", g_dbg_search / 60, g_dbg_rows[0] / 60,
+                 g_dbg_rows[1] / 60, g_dbg_rows[2] / 60);
+    g_dbg_search = g_dbg_rows[0] = g_dbg_rows[1] = g_dbg_rows[2] = 0;
+  }
   if (g_pools[0].full != full[0] || g_pools[1].full != full[1] || g_pools[2].full != full[2]) {
     debug_printf("tile slots ran out: %u (BG1), %u (BG2), %u (BG3)", g_pools[0].full - full[0],
                  g_pools[1].full - full[1], g_pools[2].full - full[2]);
