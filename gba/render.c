@@ -45,7 +45,7 @@
 // The view: which SNES line each GBA line shows. SNES lines top to
 // top + lines - 1 on the GBA's 160: GBA line y shows SNES line
 // top + y * lines / 160 (with more than 160, some lines are left out), the
-// sprites shrunk to match by affine sprites.
+// sprites made of the same lines (draw_sprites_squeezed).
 static int g_view_top = -1, g_view_lines;
 static uint8_t g_src_line[LINES];
 static uint8_t g_first_gba_line[225];   // per SNES line: the first GBA line showing it or one below
@@ -130,6 +130,7 @@ static int g_shown;                    // the frame on screen
 #define IWRAM_CODE __attribute__((section(".iwram"), target("arm"), noinline))
 
 static uint32_t g_expand[256];          // a bitplane byte -> a bit in each pixel's nibble
+static uint8_t g_reverse8[256];
 
 // The order a pool takes free slots in: segments of slots counting up
 // (step 1) or down (-1) from `first`. Each fills from its own end toward
@@ -504,15 +505,44 @@ IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap, bool o
   }
 }
 
-// Priorities, without the SNES's per-tile priority yet. Mode 1's order is,
-// front to back: BG3's priority tiles (with BGMODE's bit 3), sprites of
-// priority 3, BG1's and BG2's priority tiles, sprites 2, BG1 and BG2, sprites
-// 1, BG3 without the bit, sprites 0. On the GBA a sprite is in front of a
-// background of the same priority, and BG0 in front of BG1 of the same, so:
-// BG3 on top 0 (else 3), BG1 1, BG2 2, the fixed color's plane 3; sprites 3
-// and 2 at 1 (in front of BG1: most of its tiles are low priority), 1 at 2,
-// 0 at 3.
-static const uint8_t kObjPriority[4] = {3, 2, 1, 1};
+// Priorities. Mode 1's order is, front to back: BG3's priority tiles (with
+// BGMODE's bit 3), sprites of priority 3, BG1's and BG2's priority tiles,
+// sprites 2, BG1 and BG2, sprites 1, BG3 without the bit, sprites 0. On the
+// GBA a sprite is in front of a background of the same priority, and BG0 in
+// front of BG1 of the same, so: BG3 on top 0 (else 3), BG1 1, BG2 2, the
+// fixed color's plane 3; sprites 3 and 2 at 1 (in front of BG1: most of its
+// tiles are low priority), 1 and 0 at 3. Sprites of priority 2 lose the
+// pixels BG1's and BG2's priority tiles cover (draw_sprites_squeezed).
+static const uint8_t kObjPriority[4] = {3, 3, 1, 1};
+
+// The pixels of a BG's priority tiles that aren't transparent, on SNES
+// screen line `line`, at screen x .. x + 7: bit i for x + i. (4bpp BGs.)
+IWRAM_CODE static uint32_t bg_front_pixels(int b, int line, int x) {
+  uint8_t sc = g_hw.regs[0x07 + b];
+  uint32_t map_base = (uint32_t)(sc & 0xfc) << 8;
+  bool wide = sc & 1, tall = sc & 2;
+  uint8_t nba = g_hw.regs[0x0b];
+  uint32_t chr = (uint32_t)((b & 1) ? nba >> 4 : nba & 0xf) << 12;
+  uint32_t bx = (uint32_t)(x + g_hofs[b][line]) & 0x3ff;
+  uint32_t by = (uint32_t)(line + g_vofs[b][line] + 1) & 0x3ff;
+  uint32_t row = (by >> 3) & (tall ? 63 : 31);
+  uint32_t row_base = map_base + (row & 31) * 32 + ((row & 32) ? (wide ? 0x800 : 0x400) : 0);
+  uint32_t col_mask = wide ? 63 : 31;
+  uint32_t bits = 0;
+  for (int k = 0; k < 2; k++) {
+    uint32_t col = ((bx >> 3) + (uint32_t)k) & col_mask;
+    uint32_t e = g_hw.vram[(row_base + (col & 31) + ((col & 32) << 5)) & 0x7fff];
+    if (!(e & 0x2000)) continue;
+    uint32_t l = by & 7;
+    if (e & 0x8000) l = 7 - l;
+    uint32_t w = (chr + (e & 0x3ff) * 16 + l) & 0x7fff;
+    uint32_t a = g_hw.vram[w], c = g_hw.vram[(w + 8) & 0x7fff];
+    uint32_t m = (a | a >> 8 | c | c >> 8) & 0xff;   // bit 7: the leftmost pixel
+    if (!(e & 0x4000)) m = g_reverse8[m];            // bit 0: the leftmost
+    bits |= m << (8 * k);
+  }
+  return (bits >> (bx & 7)) & 0xff;
+}
 
 static const uint8_t kObjSizes[8][2] = {
   {8, 16}, {8, 32}, {8, 64}, {16, 32}, {16, 64}, {32, 64}, {16, 32}, {16, 32},
@@ -527,11 +557,14 @@ static const uint8_t kObjSizes[8][2] = {
 
 typedef struct {
   uint32_t key;
-  uint16_t tile;
+  uint16_t x, tile;    // x: for pictures that depend on it, X + 1 (with the flip), else 0
 } ObjPicture;
 
+// `behind`: the BGs (bits) whose priority tiles cover the sprite, at
+// screen x (flipped horizontally: hflip).
 IWRAM_CODE static void make_obj_picture(volatile uint32_t *dst, uint32_t t, int size, int tiles_w, int tiles_h,
-                                        int y, int g0, int n, bool vflip, uint32_t base, uint32_t gap) {
+                                        int y, int g0, int n, bool vflip, uint32_t base, uint32_t gap,
+                                        uint32_t behind, int x, bool hflip) {
   const uint16_t *vram = g_hw.vram;
   const uint32_t *ex = g_expand;
   for (int k = 0; k < tiles_h * 8; k++) {
@@ -548,7 +581,20 @@ IWRAM_CODE static void make_obj_picture(volatile uint32_t *dst, uint32_t t, int 
       uint32_t idx = trow | ((t + (uint32_t)tx) & 15);
       uint32_t w = (table + idx * 16 + line) & 0x7fff;
       uint32_t a = vram[w], b2 = vram[(w + 8) & 0x7fff];
-      row[tx * 8] = ex[a & 0xff] | ex[a >> 8] << 1 | ex[b2 & 0xff] << 2 | ex[b2 >> 8] << 3;
+      uint32_t px = ex[a & 0xff] | ex[a >> 8] << 1 | ex[b2 & 0xff] << 2 | ex[b2 >> 8] << 3;
+      if (behind && px) {
+        int line = g_src_line[g0 + k];
+        int sx = hflip ? x + size - 8 - tx * 8 : x + tx * 8;
+        uint32_t m = 0;
+        for (int b = 0; b < 2; b++)
+          if ((behind >> b) & 1 & g_line_tm[line]) m |= bg_front_pixels(b, line, sx);
+        if (m) {
+          if (hflip) m = g_reverse8[m];
+          // The picture's pixel i is nibble i (from the left), SNES bit 7 - i.
+          px &= ~(g_expand[g_reverse8[m]] * 15);
+        }
+      }
+      row[tx * 8] = px;
     }
   }
 }
@@ -585,10 +631,14 @@ IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, 
     int gsize = size == 8 ? 0 : size == 16 ? 1 : size == 32 ? 2 : 3;
     if (shape) gsize = size == 16 ? 0 : size == 32 ? 2 : 3;   // 16x8, 32x16, 64x32
     // The picture's lines depend on Y (and the view).
+    // Sprites of priority 2 lose pixels to BG1's and BG2's priority tiles
+    // (kObjPriority): their pictures depend on X too.
+    uint32_t behind = ((attr >> 4) & 3) == 2 && (g_hw.regs[0x05] & 7) == 1 ? 3 : 0;
     uint32_t key = t | (uint32_t)vflip << 9 | (uint32_t)(size >> 3) << 10 | (uint32_t)(y & 0x1ff) << 14;
+    uint16_t xkey = behind ? (uint16_t)(((x + 1) & 0x3ff) | (attr & 0x40) << 4) : 0;
     uint32_t tile = 0xffff;
     for (int m = 0; m < num_made; m++)
-      if (made[m].key == key) { tile = made[m].tile; break; }
+      if (made[m].key == key && made[m].x == xkey) { tile = made[m].tile; break; }
     if (tile == 0xffff) {
       uint32_t count = (uint32_t)(tiles_w * tiles_h);
       if (next + count > OBJ_HALF_TILES) {
@@ -598,9 +648,11 @@ IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, 
       }
       tile = (uint32_t)half * OBJ_HALF_TILES + next;
       next += count;
-      make_obj_picture(OBJ_VRAM + tile * 8, t, size, tiles_w, tiles_h, y, g0, n, vflip, base, gap);
+      make_obj_picture(OBJ_VRAM + tile * 8, t, size, tiles_w, tiles_h, y, g0, n, vflip, base, gap, behind, x,
+                       attr & 0x40);
       made[num_made].key = key;
       made[num_made].tile = (uint16_t)tile;
+      made[num_made].x = xkey;
       num_made++;
     }
     o[0] = (uint16_t)((g0 & 0xff) | shape << 14);
@@ -655,6 +707,11 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
 
 void render_init(void) {
   render_set_view(0, 224);
+  for (int b = 0; b < 256; b++) {
+    uint32_t r = 0;
+    for (int i = 0; i < 8; i++) r |= (uint32_t)((b >> i) & 1) << (7 - i);
+    g_reverse8[b] = (uint8_t)r;
+  }
   for (int b = 0; b < 256; b++) {
     uint32_t e = 0;
     for (int x = 0; x < 8; x++) e |= (uint32_t)((b >> (7 - x)) & 1) << (4 * x);
