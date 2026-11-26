@@ -13,6 +13,7 @@ uint32_t R_b59f40_recomp(uint32_t entry);
 uint32_t R_80e580_recomp(uint32_t entry);
 uint32_t R_b5a8da_recomp(uint32_t entry);
 uint32_t R_b5f5e1_recomp(uint32_t entry);
+uint32_t R_bb8000_recomp(uint32_t entry);
 
 // The direct page (D = 0, bank 0), absolute with DB = $B5, long.
 static inline uint8_t d8(uint16_t a) { return rd8_b0(a); }
@@ -589,4 +590,332 @@ uint32_t R_b5f5e1(uint32_t entry) {
       } while (x);
     }
   }
+}
+
+// ---- decompress_data ($BB8D91) and decompress_data_default ($BB8D9E) ----
+//
+// The game's decompressor: a stream of nibbles, each command in the high
+// nibble of a byte (set 1) or the low one (set 2), the commands' operands
+// in the nibbles that follow. Native here command by command, as the 65816
+// code does to memory: the output, the direct page's variables, the nibble
+// tables it builds at $7E2000, and the stack's bytes (the PEIs that
+// dispatch the commands, the PHYs, the lookup builder's JSL), done with
+// real pushes and pulls. Every command is entered with carry clear, so the
+// ADCs without a CLC are plain adds.
+
+enum { SET1, SET2, SET2_WIDE, DONE };
+
+uint32_t R_bb8000(uint32_t entry) {
+  if ((entry != 0xbb8d91 && entry != 0xbb8d9e) || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf)
+    return R_bb8000_recomp(entry);
+  uint16_t a = cpu.a, x = cpu.x, y = cpu.y;
+  if (entry == 0xbb8d91) {
+    s16(0x38, a);
+    s16(0x3a, 0x007f);
+    s16(0x34, x);
+    s16(0x36, y);
+  } else {
+    s16(0x34, x);
+    s16(0x36, y);
+    x = y;
+    s16(0x38, 0x0000);
+    s16(0x3a, 0x007f);
+  }
+  // start_decompression
+  s16(0x32, 0xffff);
+  push8(cpu.db);
+  push16(y);
+  s16(0x46, 0x2100);
+  s16(0x48, 0x007e);
+  s16(0x44, 0x007e);
+  s16(0x42, 0x2000);
+  // JSL build_decompression_lookup: the nibble tables
+  push8(0xbb);
+  push16(0x8dc9);
+  for (int i = 0; i < 256; i++) {
+    wr8(0x7e2100 + i, (uint8_t)((i & 0x0f) << 4));
+    wr8(0x7e2000 + i, (uint8_t)(i >> 4));
+  }
+  pull16();
+  pull8();
+  x = d16(0x38);
+  y = 1;
+  s16(0x4e, 0x8001);
+  s16(0x4a, 0x8040);
+  // DB = the destination's bank (PHA; PLB)
+  uint8_t dbank = d8(0x3a);
+  push8(dbank);
+  pull8();
+  uint32_t db = (uint32_t)dbank << 16;
+  uint32_t src = ptr24(0x34);
+  #define SRC() rd8((src + y++) & 0xffffff)
+  #define OUT(v) wr8((db + x++) & 0xffffff, (uint8_t)(v))
+  #define LO(v) ((uint8_t)((v) >> 4))          /* [$42]: the high nibble, as a value */
+  #define HI(v) ((uint8_t)(((v) & 0x0f) << 4)) /* [$46]: the low nibble, moved up */
+  s8(0x52, SRC());
+  s8(0x53, SRC());
+  s8(0x56, SRC());
+  s8(0x57, SRC());
+  s16(0x54, (uint16_t)(ind8(src, y) | ind8(src, (uint16_t)(y + 1)) << 8));
+  y = 0x27;
+  s16(0x3c, 0);
+  s16(0x3e, 0);
+  int next = SET1;
+  for (;;) {
+    int cmd;
+    // The dispatch: PEI of the command's address, RTS
+    if (next == SET1) {
+      uint8_t b = SRC();
+      s8(0x46, b);
+      s8(0x4e, (uint8_t)((b & 0xf0) >> 2));
+      push16(d16(0x4e));
+      pull16();
+      cmd = b >> 4;
+    } else {
+      uint8_t n = (next == SET2 ? d8(0x42) : d8(0x46)) & 0x0f;
+      s8(0x4a, (uint8_t)((n << 2) + 0x3f));
+      push16(d16(0x4a));
+      pull16();
+      cmd = 16 + n;
+    }
+    uint8_t op = d8(0x46);
+    switch (cmd) {
+      case 0: {   // copy_or_return_1
+        uint8_t n = op & 0x0f;
+        if (!n) { next = DONE; break; }
+        s8(0x3c, n);
+        do { OUT(SRC()); s8(0x3c, (uint8_t)(d8(0x3c) - 1)); } while (d8(0x3c));
+        next = SET1;
+        break;
+      }
+      case 16: {  // copy_or_return_2
+        uint8_t b = SRC();
+        s8(0x42, b);
+        s8(0x46, b);
+        if (!LO(b)) { next = DONE; break; }
+        s8(0x3c, LO(b));
+        do {
+          s8(0x3e, HI(d8(0x46)));
+          b = SRC();
+          s8(0x42, b);
+          s8(0x46, b);
+          OUT(d8(0x3e) | LO(b));
+          s8(0x3c, (uint8_t)(d8(0x3c) - 1));
+        } while (d8(0x3c));
+        next = SET2_WIDE;
+        break;
+      }
+      case 1: {   // stream_byte_1
+        s8(0x3e, HI(op));
+        uint8_t b = SRC();
+        s8(0x42, b);
+        OUT(d8(0x3e) | LO(b));
+        next = SET2;
+        break;
+      }
+      case 17:    // stream_byte_2
+        OUT(SRC());
+        next = SET1;
+        break;
+      case 2: {   // stream_word_1
+        s8(0x3e, HI(op));
+        uint8_t b = SRC();
+        s8(0x42, b);
+        s8(0x46, b);
+        OUT(d8(0x3e) | LO(b));
+        s8(0x3e, HI(b));
+        b = SRC();
+        s8(0x42, b);
+        OUT(d8(0x3e) | LO(b));
+        next = SET2;
+        break;
+      }
+      case 18: {  // stream_word_2
+        uint16_t w = (uint16_t)(ind8(src, y) | ind8(src, (uint16_t)(y + 1)) << 8);
+        wr16((db + x) & 0xffffff, w);
+        y += 2;
+        x += 2;
+        next = SET1;
+        break;
+      }
+      case 3: case 4: case 5: {   // stream_byte_fill_1, direct_byte_1/2_fill_1
+        uint8_t n = (uint8_t)((op & 0x0f) + 3);
+        s8(0x3c, n);
+        uint8_t v = cmd == 3 ? SRC() : d8(cmd == 4 ? 0x52 : 0x53);
+        do { OUT(v); s8(0x3c, (uint8_t)(d8(0x3c) - 1)); } while (d8(0x3c));
+        next = SET1;
+        break;
+      }
+      case 19: {  // stream_byte_fill_2
+        uint8_t b = SRC();
+        s8(0x42, b);
+        s8(0x46, b);
+        s8(0x3c, (uint8_t)(LO(b) + 3));
+        s8(0x3e, HI(b));
+        b = SRC();
+        s8(0x42, b);
+        uint8_t v = d8(0x3e) | LO(b);
+        do { OUT(v); s8(0x3c, (uint8_t)(d8(0x3c) - 1)); } while (d8(0x3c));
+        next = SET2;
+        break;
+      }
+      case 20: case 21: {   // direct_byte_1/2_fill_2
+        uint8_t b = SRC();
+        s8(0x42, b);
+        s8(0x3c, (uint8_t)(LO(b) + 3));
+        uint8_t v = d8(cmd == 20 ? 0x52 : 0x53);
+        do { OUT(v); s8(0x3c, (uint8_t)(d8(0x3c) - 1)); } while (d8(0x3c));
+        next = SET2;
+        break;
+      }
+      case 6: case 22:   // direct_word_put_1/2
+        wr16((db + x) & 0xffffff, d16(0x54));
+        x += 2;
+        next = cmd == 6 ? SET2_WIDE : SET1;
+        break;
+      case 7: case 23:   // direct_byte_1_put_1/2
+        OUT(d8(0x56));
+        next = cmd == 7 ? SET2_WIDE : SET1;
+        break;
+      case 8: case 24:   // direct_byte_2_put_1/2
+        OUT(d8(0x57));
+        next = cmd == 8 ? SET2_WIDE : SET1;
+        break;
+      case 9: case 25: {   // back_copy_word_1/2
+        if (cmd == 9) {
+          push16(y);
+          s8(0x3e, (uint8_t)((op & 0x0f) + 2));
+        } else {
+          uint8_t b = SRC();
+          s8(0x42, b);
+          s8(0x3e, (uint8_t)(LO(b) + 2));
+          push16(y);
+        }
+        uint16_t from = (uint16_t)(x - d16(0x3e));
+        wr16((db + x) & 0xffffff, rd16((db + from) & 0xffffff));
+        x += 2;
+        y = pull16();
+        next = cmd == 9 ? SET1 : SET2;
+        break;
+      }
+      case 10: case 26: case 11: case 27: case 12: case 28: {   // back copies
+        uint16_t from;
+        int then;
+        if (cmd == 10) {   // back_copy_1
+          s8(0x3c, (uint8_t)((op & 0x0f) + 3));
+          s8(0x3e, SRC());
+          push16(y);
+          from = (uint16_t)(x - d16(0x3c) - d16(0x3e));
+          then = SET1;
+        } else if (cmd == 26) {   // back_copy_2
+          uint8_t b = SRC();
+          s8(0x42, b);
+          s8(0x46, b);
+          s8(0x3c, (uint8_t)(LO(b) + 3));
+          s8(0x3e, HI(b));
+          b = SRC();
+          s8(0x42, b);
+          s8(0x3e, LO(b) | d8(0x3e));
+          push16(y);
+          from = (uint16_t)(x - d16(0x3c) - d16(0x3e));
+          then = SET2;
+        } else if (cmd == 11) {   // back_copy_far_1
+          s8(0x3c, (uint8_t)((op & 0x0f) + 3));
+          uint8_t hi = SRC(), lo = SRC();
+          s8(0x46, lo);
+          s16(0x40, (uint16_t)(((hi << 8 | lo) >> 4) + 0x0103));
+          push16(y);
+          from = (uint16_t)(x - d16(0x40));
+          then = SET2_WIDE;
+        } else if (cmd == 27) {   // back_copy_far_2
+          uint8_t b = SRC();
+          s8(0x42, b);
+          s8(0x3c, (uint8_t)(LO(b) + 3));
+          uint8_t lo = SRC();
+          s16(0x40, (uint16_t)(((b & 0x0f) << 8 | lo) + 0x0103));
+          push16(y);
+          from = (uint16_t)(x - d16(0x40));
+          then = SET1;
+        } else if (cmd == 12) {   // back_copy_arbitrary_1
+          s8(0x3c, (uint8_t)((op & 0x0f) + 3));
+          uint16_t w = (uint16_t)(ind8(src, y) | ind8(src, (uint16_t)(y + 1)) << 8);
+          s16(0x40, (uint16_t)(w >> 8 | w << 8));
+          y += 2;
+          push16(y);
+          from = (uint16_t)(x - d16(0x40));
+          then = SET1;
+        } else {   // back_copy_arbitrary_2
+          uint8_t b = SRC();
+          s8(0x42, b);
+          s8(0x3c, (uint8_t)(LO(b) + 3));
+          uint8_t lo = SRC();
+          s16(0x40, (uint16_t)((b << 8 | lo) << 4));
+          uint8_t b2 = SRC();
+          push16(y);
+          s8(0x42, b2);
+          s16(0x40, (uint16_t)(LO(b2) | d16(0x40)));
+          from = (uint16_t)(x - d16(0x40));
+          then = SET2;
+        }
+        do {
+          OUT(rd8((db + from++) & 0xffffff));
+          s8(0x3c, (uint8_t)(d8(0x3c) - 1));
+        } while (d8(0x3c));
+        y = pull16();
+        next = then;
+        break;
+      }
+      case 13: case 29:   // duplicate_byte_1/2
+        wr8((db + (uint16_t)(x - 1) + 1) & 0xffffff, rd8((db + (uint16_t)(x - 1)) & 0xffffff));
+        x += 1;
+        next = cmd == 13 ? SET2_WIDE : SET1;
+        break;
+      case 14: case 30:   // duplicate_word_1/2
+        wr16((db + (uint16_t)(x - 2) + 2) & 0xffffff, rd16((db + (uint16_t)(x - 2)) & 0xffffff));
+        x += 2;
+        next = cmd == 14 ? SET2_WIDE : SET1;
+        break;
+      case 15: {  // copy_future_word_1: a word of the header
+        push16(y);
+        uint16_t at = (uint16_t)(((op & 0x0f) << 1) + 7);
+        wr16((db + x) & 0xffffff, (uint16_t)(ind8(src, at) | ind8(src, (uint16_t)(at + 1)) << 8));
+        x += 2;
+        y = pull16();
+        next = SET1;
+        break;
+      }
+      case 31: {  // copy_future_word_2
+        uint8_t b = SRC();
+        s8(0x46, b);
+        push16(y);
+        uint16_t at = (uint16_t)(((b & 0xf0) >> 3) + 7);
+        wr16((db + x) & 0xffffff, (uint16_t)(ind8(src, at) | ind8(src, (uint16_t)(at + 1)) << 8));
+        x += 2;
+        y = pull16();
+        next = SET2_WIDE;
+        break;
+      }
+    }
+    if (next == DONE) break;
+  }
+  #undef SRC
+  #undef OUT
+  #undef LO
+  #undef HI
+  // finalize_decompression: REP #$20; PLY; PLB; X = the length; LDA $32 ($FFFF: no DMA); RTL
+  y = pull16();
+  cpu.db = pull8();
+  uint8_t c = 1, v = 0;
+  x = sbc16v(x, d16(0x38), &c, &v);
+  cpu.a = d16(0x32);
+  cpu.x = x;
+  cpu.y = y;
+  cpu.c = c;
+  cpu.v = v;
+  cpu.n = (cpu.a >> 15) & 1;
+  cpu.z = cpu.a == 0;
+  cpu.mf = 0;
+  uint16_t r = pull16();
+  uint32_t b = pull8();
+  return b << 16 | (uint16_t)(r + 1);
 }

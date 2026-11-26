@@ -75,7 +75,8 @@ map's row drawn once whatever each line's scroll, HDMA run on a copy of
 its state in IWRAM, the recompiled code as Thumb (half the ROM fetches), and native C for
 the hottest routines (`src/native.c`: the objects' sprites into OAM, the
 levels' parallax tables, the sort of the objects by drawing order, the
-levels' tiled objects' sprites).
+levels' tiled objects' sprites, and the decompressor, which loading and the
+levels' transitions spend their time in).
 What's left: the game's own logic (the recompiled code:
 about 60%: executing it, not its memory: it makes only ~5,000 WRAM
 accesses a frame, half in the direct page and stack), the map rows, HDMA. IWRAM (32 KB) and EWRAM (256 KB, half of
