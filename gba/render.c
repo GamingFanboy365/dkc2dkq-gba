@@ -49,6 +49,7 @@
 #define POOL_B_BASE 0x8000            // charblock 2
 #define POOL_B_SLOTS 576              // to 0xC800; the last is the fixed color's tile
 #define PLANE_SLOT (POOL_B_SLOTS - 1)
+#define EMPTY_SLOT_B (POOL_B_SLOTS - 2)   // a transparent tile, for cells left out
 #define PLANE_SCREENBLOCK 25          // 0xC800: the fixed color's map
 #define SCREENBLOCK(n) ((volatile uint16_t *)(0x06000000 + (n) * 0x800))
 #define FIRST_SCREENBLOCK 26          // 26-28: the three BGs' maps
@@ -92,7 +93,7 @@ typedef struct {
 EWRAM_DATA static uint16_t g_slot_a[2048], g_owner_a[POOL_A_SLOTS], g_refs_a[POOL_A_SLOTS];
 EWRAM_DATA static uint16_t g_slot_b[4096], g_owner_b[POOL_B_SLOTS], g_refs_b[POOL_B_SLOTS];
 static Pool g_pool_a = {g_slot_a, g_owner_a, g_refs_a, POOL_A_SLOTS, 0, 0, 4, 0};
-static Pool g_pool_b = {g_slot_b, g_owner_b, g_refs_b, PLANE_SLOT, 0, POOL_B_BASE, 3, 0};
+static Pool g_pool_b = {g_slot_b, g_owner_b, g_refs_b, EMPTY_SLOT_B, 0, POOL_B_BASE, 3, 0};
 
 IWRAM_CODE static void convert_tile(const Pool *p, uint32_t tile, uint32_t slot) {
   volatile uint32_t *dst = (volatile uint32_t *)(BG_VRAM + p->base + slot * 32);
@@ -224,7 +225,7 @@ static uint16_t scale_color(uint16_t c, int b) {
 
 IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wide, uint32_t chr,
                                 uint32_t words_per_tile, uint16_t pal_add, volatile uint16_t *dst_row,
-                                uint32_t *keys, Pool *pool) {
+                                uint32_t *keys, Pool *pool, uint32_t need_priority) {
   const uint16_t *vram = g_hw.vram;
   uint32_t col_mask = wide ? 63 : 31;
   for (int k = 0; k < 31; k++) {
@@ -235,9 +236,14 @@ IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wi
     uint32_t cell = col & 31;
     if (keys[cell] == key) continue;
     if (keys[cell] != NO_KEY) release(pool, dst_row[cell] & 0x3ff);
+    keys[cell] = key;
+    if ((e & need_priority) != need_priority) {
+      // A tile this layer doesn't show (see draw_bg).
+      dst_row[cell] = EMPTY_SLOT_B;
+      continue;
+    }
     uint32_t tile = ((chr + (e & 0x3ff) * words_per_tile) & 0x7fff) >> pool->shift;
     uint32_t slot = acquire(pool, tile);
-    keys[cell] = key;
     dst_row[cell] = (uint16_t)(slot | (e & 0xc000) >> 4 | ((e >> 10) & 7) << 12 | pal_add);
   }
 }
@@ -248,7 +254,11 @@ __attribute__((noinline)) static void draw_bg(int b, int bpp, Frame *f) {
   bool wide = sc & 1, tall = sc & 2;
   uint8_t nba = b < 2 ? g_hw.regs[0x0b] : g_hw.regs[0x0c];
   uint32_t chr = (uint32_t)((b & 1) ? nba >> 4 : nba & 0xf) << 12;   // words
-  uint32_t setup = (uint32_t)(bpp == 2) << 31 | sc << 16 | chr;
+  // With BGMODE's bit 3 in Mode 1, BG3's priority tiles go in front of
+  // everything and the rest behind everything (behind the opaque sky, in the
+  // levels): BG3 is drawn in front, with its priority tiles only.
+  uint32_t need_priority = (b == 2 && (g_hw.regs[0x05] & 0x0f) == 0x09) ? 0x2000 : 0;
+  uint32_t setup = (uint32_t)(bpp == 2) << 31 | (need_priority != 0) << 30 | sc << 16 | chr;
   if (setup != g_bg_setup[b]) {
     clear_cells(b);
     g_bg_setup[b] = setup;
@@ -257,22 +267,50 @@ __attribute__((noinline)) static void draw_bg(int b, int bpp, Frame *f) {
   volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
   uint32_t words_per_tile = bpp * 4;
   uint16_t pal_add = bpp == 2 ? 8 << 12 : 0;
-  int last_row = -1;
+  uint32_t row_mask = tall ? 63 : 31, col_mask = wide ? 63 : 31;
+  // Which SNES row, and which window of its columns, each GBA map row shows
+  // this frame. A tile row normally goes in GBA row (row & 31); if its lines
+  // scroll differently (HDMA: the clouds' bands), a second window of columns
+  // goes in a spare GBA row (32 rows, ~21 on screen), and those lines' VOFS
+  // point at it.
+  int16_t row_of[32];
+  uint8_t window_of[32];
+  uint32_t natural = 0;
+  for (int i = 0; i < 32; i++) row_of[i] = -1;
+  for (int gy = 0; gy < LINES; gy++) {
+    int sy = gy + CROP_Y;
+    natural |= 1u << (((sy + g_vofs[b][sy] + 1) >> 3) & 31);
+  }
   g_visible_rows[b] = 0;
   for (int gy = 0; gy < LINES; gy++) {
     int sy = gy + CROP_Y;
     uint32_t hofs = g_hofs[b][sy], vofs = g_vofs[b][sy];
-    f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
-    f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((vofs + 1 + CROP_Y) & 0x1ff);
-    int row = ((sy + vofs + 1) >> 3) & (tall ? 63 : 31);
-    if (row == last_row) continue;
-    last_row = row;
+    uint32_t bgy = sy + vofs + 1;
+    uint32_t row = (bgy >> 3) & row_mask;
     uint32_t col0 = (hofs + CROP_X) >> 3;
-    g_visible_rows[b] |= 1u << (row & 31);
-    g_row_col0[b][row & 31] = (uint8_t)(col0 & 31);
-    uint32_t row_base = map_base + (row & 31) * 32 + ((row & 32) ? (wide ? 0x800 : 0x400) : 0);
-    draw_row(b, row_base, col0, wide, chr, words_per_tile, pal_add, map + (row & 31) * 32,
-             g_cell_key[b] + (row & 31) * 32, pool);
+    uint8_t window = (uint8_t)(col0 & col_mask);
+    int g = row & 31;
+    if (row_of[g] >= 0 && (row_of[g] != (int)row || window_of[g] != window)) {
+      // This GBA row shows something else: another row already drawn for
+      // these lines' window, or a spare one.
+      int found = -1;
+      for (int i = 0; i < 32 && found < 0; i++)
+        if (row_of[i] == (int)row && window_of[i] == window) found = i;
+      for (int i = 0; i < 32 && found < 0; i++)
+        if (row_of[i] < 0 && !((natural >> i) & 1)) found = i;
+      if (found >= 0) g = found;
+    }
+    if (row_of[g] != (int)row || window_of[g] != window) {
+      row_of[g] = (int16_t)row;
+      window_of[g] = window;
+      g_visible_rows[b] |= 1u << g;
+      g_row_col0[b][g] = (uint8_t)(col0 & 31);
+      uint32_t row_base = map_base + (row & 31) * 32 + ((row & 32) ? (wide ? 0x800 : 0x400) : 0);
+      draw_row(b, row_base, col0, wide, chr, words_per_tile, pal_add, map + g * 32,
+               g_cell_key[b] + g * 32, pool, need_priority);
+    }
+    f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
+    f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((g * 8 + (bgy & 7) - gy) & 0x1ff);
   }
 }
 
@@ -395,6 +433,8 @@ void render_init(void) {
   // (BG3's 2bpp palettes use only colors 0-3 of 8-15).
   volatile uint32_t *tile = (volatile uint32_t *)(BG_VRAM + POOL_B_BASE + PLANE_SLOT * 32);
   for (int r = 0; r < 8; r++) tile[r] = 0xffffffff;
+  volatile uint32_t *empty = (volatile uint32_t *)(BG_VRAM + POOL_B_BASE + EMPTY_SLOT_B * 32);
+  for (int r = 0; r < 8; r++) empty[r] = 0;
   for (int i = 0; i < 1024; i++) SCREENBLOCK(PLANE_SCREENBLOCK)[i] = (uint16_t)(PLANE_SLOT | 15 << 12);
   REG_DISPCNT = 0x0080;   // blank until the first frame
 }
