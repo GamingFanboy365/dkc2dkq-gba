@@ -324,7 +324,7 @@ IWRAM_CODE static void tile_changed(Pool *p, uint32_t tile) {
 #define M7_SCREENBLOCK 8
 static bool g_m7_shown;
 
-IWRAM_CODE static void convert_mode7(void) {
+static void convert_mode7(void) {   // (rare: ROM)
   volatile uint32_t *tiles = (volatile uint32_t *)0x06000000;
   volatile uint32_t *map = (volatile uint32_t *)(0x06000000 + M7_SCREENBLOCK * 0x800);
   const uint16_t *v = g_hw.vram;
@@ -395,6 +395,7 @@ static void note_cgram_write(int line) {
 }
 
 static uint8_t g_line_mode[224];   // BGMODE per SNES line
+static bool g_any_mode5;           // a shown line in Mode 5 this frame
 
 // Mode 7: where SNES screen line `line`'s first pixel is in the 1024x1024
 // picture (8.8), LakeSnes's sums (the reference), from the matrix as the
@@ -591,12 +592,10 @@ IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
   // point at it.
   int16_t row_of[32];
   uint8_t window_of[32];
-  uint32_t natural = 0;
+  uint32_t natural = 0;   // the GBA rows the lines' rows go in, found when a spare one is needed
+  bool natural_known = false;
   for (int i = 0; i < 32; i++) row_of[i] = -1;
-  for (int gy = 0; gy < LINES; gy++) {
-    int sy = g_src_line[gy];
-    natural |= 1u << (((sy + g_vofs[b][sy] + 1) >> 3) & 31);
-  }
+  bool maybe_hires = b == 0 && bpp == 4 && g_any_mode5;
   g_visible_rows[b] = 0;
   int last_row = -1, last_window = -1, last_g = 0;
   for (int gy = 0; gy < LINES; gy++) {
@@ -606,7 +605,7 @@ IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
     uint32_t row = (bgy >> 3) & row_mask;
     uint32_t col0 = (hofs + CROP_X) >> 3;
     // BG1 on a Mode 5 line: its 16-pixel tiles, halved (the HIRES_POOL).
-    bool hires = b == 0 && bpp == 4 && (g_line_mode[sy] & 7) == 5;
+    bool hires = maybe_hires && (g_line_mode[sy] & 7) == 5;
     // A map 32 tiles wide fits a GBA row whole: any scroll shows it (one
     // window); a wider one, the 31 columns from col0.
     uint8_t window = (uint8_t)((wide ? col0 & col_mask : 0) | (uint32_t)hires << 7);
@@ -626,6 +625,13 @@ IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
       // This GBA row shows something else: another row already drawn for
       // these lines' window, or a spare one.
       int found = -1;
+      if (!natural_known) {
+        for (int y = 0; y < LINES; y++) {
+          int ly = g_src_line[y];
+          natural |= 1u << (((ly + g_vofs[b][ly] + 1) >> 3) & 31);
+        }
+        natural_known = true;
+      }
       for (int i = 0; i < 32 && found < 0; i++)
         if (row_of[i] == (int)row && window_of[i] == window) found = i;
       for (int i = 0; i < 32 && found < 0; i++)
@@ -973,6 +979,8 @@ IWRAM_CODE void render_frame(void) {
 
   // The mode: the middle line's.
   uint8_t inidisp = g_hw.regs[0x00], mode = g_line_mode[g_src_line[LINES / 2]] & 7;
+  g_any_mode5 = false;
+  for (int gy = 0; gy < LINES; gy++) g_any_mode5 |= (g_line_mode[g_src_line[gy]] & 7) == 5;
 
   // VRAM's changes since the last frame, into the cached tiles (or Mode 7's).
   bool m7_changed = false;
