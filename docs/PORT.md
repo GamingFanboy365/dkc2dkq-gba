@@ -14,40 +14,48 @@ code or a cartridge.
 
 ## Where it stands
 
-- **The game's code, recompiled**: 79,838 instructions, 6,379 routines,
-  one C function each. The disassembly says where the code is, the ROM what
-  it is; the M/X register widths come from a flow analysis and a trace of
-  the original (`traces/`). The trace also corrects the disassembly where it
-  decoded bytes at the wrong width (`$B5A262`).
+- **The game's code, recompiled**: 79,844 instructions, as 2,649 C
+  functions (the disassembly's routines, merged where they pass control to
+  each other by branches and jumps). The disassembly says where the code is,
+  the ROM what it is; the M/X register widths come from a flow analysis and
+  traces of the original (`traces/`). The traces also correct the
+  disassembly where it decoded bytes at the wrong width (five spots in bank
+  B5).
 - **Checked against an emulator**: WRAM after every frame of the game's
   logic matches the original running on LakeSnes, on LakeSnes's hardware
   (`hostrun`) and on the port's own hardware model (`hostmini`), over two
-  sessions: power on to the title screen (2805 game frames; VRAM and CGRAM
-  match there too), and a scripted play session (6193 game frames: file
-  select, the world map, Pirate Panic with runs, jumps, rolls, team-ups,
-  swaps, pauses, a death, the map again and back in).
-- **On the GBA**: the same code and model run on the GBA (mGBA), and the
-  states it reached (1622, to the title) match the reference too.
-- **Not yet**: nothing is drawn or played on the GBA (the PPU's state is
-  recorded, not rendered; the sound CPU only answers handshakes). Only the
-  first level is verified: code the traces haven't seen run may have
-  entries or register widths the recompiler doesn't know.
+  sessions: power on to the title screen (2805 game frames), and a scripted
+  play session (6193 game frames: file select, the world map, Pirate Panic
+  with runs, jumps, rolls, team-ups, swaps, pauses, deaths, the cabin, the
+  map again and back in). The GBA's states match too, as far as checked.
+- **The picture**: `gba/render.c` draws the game with the GBA's video
+  hardware (see its top comment). Against the SNES's own picture of the
+  same frames (240x160 of it): the file select and the cabin are
+  pixel-exact, Pirate Panic within 0.1% of its pixels (sky gradient, ropes in
+  front, sprites). Not right yet: the Rareware logo (Mode 7), the world map
+  (it changes layers and colors line by line) and a few frames; the window
+  is fixed rather than following the Kong.
+- **Not yet**: sound (the sound CPU only answers handshakes); saves; only
+  the first level is verified (code the traces haven't seen run may have
+  entries or register widths the recompiler doesn't know).
 
-## Speed, before any optimization
+## Speed
 
-GBA cycles per SNES frame (a GBA frame is 280,896), everything in Thumb in
-ROM, every memory access a function call:
+GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 
-| Screen | Cycles per frame |
-|---|---|
-| Logos | 200,000–300,000 |
-| Title | 620,000 (2.2 frames) |
-| The sequence after the title | 1.3–2.6 million (5–9 frames) |
-| Boot (clearing VRAM and WRAM a byte at a time) | up to 62 million, once |
+| | Logic | Drawing | Together |
+|---|---|---|---|
+| First build | 1,530,000 | 920,000 | 2,450,000 (8.7 frames) |
+| Now | 575,000 | 315,000 | 890,000 (3.2 frames) |
 
-The guide's remedies are next: hot code as ARM in IWRAM, direct access to
-WRAM for the direct page, the stack and bank $7E, DMA by the GBA's DMA, and
-dropping the cycle count the PC builds need.
+What did it, measured with gbarun's sampling profiler (`PROFILE=`,
+`tools/profile_report.py`): the memory map inline, DMA to VRAM/OAM/CGRAM as
+copy loops, calls that return normally kept native, routines merged into
+bigger functions, a page index for the dispatcher, no cycle counting on the
+GBA; in the renderer, map cells and tile slots rewritten only when what they
+show changes, VRAM's dirty bits, hot loops as ARM in IWRAM. What's left is
+spread out: HDMA (~10%), the game's own decompression and object code, the
+map and sprite loops.
 
 ## Building and checking
 
