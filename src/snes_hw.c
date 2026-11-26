@@ -1,0 +1,387 @@
+// See snes_hw.h. The ports behave as LakeSnes's (third_party/lakesnes/ppu.c,
+// snes.c, dma.c, cart.c), which is what the game is checked against.
+#include "snes_hw.h"
+
+#include <string.h>
+
+#include "cpu65.h"
+
+#ifndef EWRAM_DATA
+#define EWRAM_DATA
+#endif
+
+EWRAM_DATA SnesHw g_hw;
+EWRAM_DATA uint8_t g_wram[0x20000];
+EWRAM_DATA uint8_t g_sram[0x800];
+const uint8_t *g_rom;
+uint32_t g_rom_mask;
+
+void hw_reset(void) {
+  memset(&g_hw, 0, sizeof(g_hw));
+  memset(g_wram, 0, sizeof(g_wram));
+  g_hw.vram_increment = 1;
+  g_hw.multiply_a = 0xff;
+  g_hw.multiply_result = 0xfe01;
+  g_hw.divide_a = 0xffff;
+  g_hw.divide_result = 0x101;
+  // What the APU's IPL ROM shows when it's ready for an upload.
+  g_hw.apu_out[0] = 0xaa;
+  g_hw.apu_out[1] = 0xbb;
+}
+
+// Buttons in the order the serial port shifts them out: B first.
+static uint16_t serial_order(uint16_t joy) {
+  uint16_t s = 0;
+  for (int i = 0; i < 16; i++)
+    if (joy & (0x8000 >> i)) s |= 1 << i;
+  return s;
+}
+
+void hw_vblank(uint16_t joy1) {
+  g_hw.in_nmi = 1;
+  g_hw.joy1_now = joy1;
+  if (g_hw.nmitimen & 1) {
+    // Auto-joypad: latch, shift 16 bits out of each port (ones shift in).
+    g_hw.joy[0] = joy1;
+    g_hw.joy[1] = 0;
+    g_hw.serial[0] = g_hw.serial[1] = 0xffff;
+  }
+}
+
+static uint8_t serial_read(int port) {
+  if (g_hw.strobe) g_hw.serial[port] = port ? 0 : serial_order(g_hw.joy1_now);
+  uint8_t bit = g_hw.serial[port] & 1;
+  g_hw.serial[port] = g_hw.serial[port] >> 1 | 0x8000;
+  return bit;
+}
+
+// ---- PPU ports ----
+
+static uint16_t vram_remap(void) {
+  uint16_t adr = g_hw.vram_pointer;
+  switch (g_hw.vram_remap) {
+    case 0: return adr;
+    case 1: return (adr & 0xff00) | ((adr & 0xe0) >> 5) | ((adr & 0x1f) << 3);
+    case 2: return (adr & 0xfe00) | ((adr & 0x1c0) >> 6) | ((adr & 0x3f) << 3);
+    default: return (adr & 0xfc00) | ((adr & 0x380) >> 7) | ((adr & 0x7f) << 3);
+  }
+}
+
+static void ppu_write(uint8_t adr, uint8_t val) {
+  g_hw.regs[adr] = val;
+  switch (adr) {
+    case 0x02:
+      g_hw.oam_adr = g_hw.oam_adr_written = val;
+      g_hw.oam_in_high = g_hw.oam_in_high_written;
+      g_hw.oam_second_write = 0;
+      break;
+    case 0x03:
+      g_hw.oam_in_high = g_hw.oam_in_high_written = val & 1;
+      g_hw.oam_adr = g_hw.oam_adr_written;
+      g_hw.oam_second_write = 0;
+      break;
+    case 0x04:
+      if (g_hw.oam_in_high) {
+        g_hw.high_oam[((g_hw.oam_adr & 0xf) << 1) | g_hw.oam_second_write] = val;
+        if (g_hw.oam_second_write) {
+          g_hw.oam_adr++;
+          if (g_hw.oam_adr == 0) g_hw.oam_in_high = 0;
+        }
+      } else if (!g_hw.oam_second_write) {
+        g_hw.oam_buffer = val;
+      } else {
+        g_hw.oam[g_hw.oam_adr++] = (uint16_t)(val << 8 | g_hw.oam_buffer);
+        if (g_hw.oam_adr == 0) g_hw.oam_in_high = 1;
+      }
+      g_hw.oam_second_write ^= 1;
+      break;
+    case 0x15:
+      g_hw.vram_increment = (val & 3) == 0 ? 1 : (val & 3) == 1 ? 32 : 128;
+      g_hw.vram_remap = (val & 0xc) >> 2;
+      g_hw.vram_increment_on_high = val >> 7;
+      break;
+    case 0x16:
+      g_hw.vram_pointer = (g_hw.vram_pointer & 0xff00) | val;
+      g_hw.vram_read_buffer = g_hw.vram[vram_remap() & 0x7fff];
+      break;
+    case 0x17:
+      g_hw.vram_pointer = (uint16_t)((g_hw.vram_pointer & 0x00ff) | val << 8);
+      g_hw.vram_read_buffer = g_hw.vram[vram_remap() & 0x7fff];
+      break;
+    case 0x18: {
+      uint16_t a = vram_remap() & 0x7fff;
+      g_hw.vram[a] = (g_hw.vram[a] & 0xff00) | val;
+      if (!g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
+      break;
+    }
+    case 0x19: {
+      uint16_t a = vram_remap() & 0x7fff;
+      g_hw.vram[a] = (uint16_t)((g_hw.vram[a] & 0x00ff) | val << 8);
+      if (g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
+      break;
+    }
+    case 0x1b: case 0x1c:
+      g_hw.m7matrix[adr - 0x1b] = (int16_t)(val << 8 | g_hw.m7prev);
+      g_hw.m7prev = val;
+      break;
+    case 0x1d: case 0x1e: case 0x1f: case 0x20:
+      g_hw.m7prev = val;
+      break;
+    case 0x21:
+      g_hw.cgram_pointer = val;
+      g_hw.cgram_second_write = 0;
+      break;
+    case 0x22:
+      if (!g_hw.cgram_second_write) g_hw.cgram_buffer = val;
+      else g_hw.cgram[g_hw.cgram_pointer++] = (uint16_t)(val << 8 | g_hw.cgram_buffer);
+      g_hw.cgram_second_write ^= 1;
+      break;
+    default:
+      break;
+  }
+}
+
+static uint8_t ppu_read(uint8_t adr) {
+  switch (adr) {
+    case 0x34: case 0x35: case 0x36: {
+      int32_t r = (int32_t)g_hw.m7matrix[0] * (int8_t)(g_hw.m7matrix[1] >> 8);
+      return (uint8_t)(r >> (8 * (adr - 0x34)));
+    }
+    case 0x38: {
+      uint8_t ret;
+      if (g_hw.oam_in_high) {
+        ret = g_hw.high_oam[((g_hw.oam_adr & 0xf) << 1) | g_hw.oam_second_write];
+        if (g_hw.oam_second_write) {
+          g_hw.oam_adr++;
+          if (g_hw.oam_adr == 0) g_hw.oam_in_high = 0;
+        }
+      } else if (!g_hw.oam_second_write) {
+        ret = g_hw.oam[g_hw.oam_adr] & 0xff;
+      } else {
+        ret = g_hw.oam[g_hw.oam_adr++] >> 8;
+        if (g_hw.oam_adr == 0) g_hw.oam_in_high = 1;
+      }
+      g_hw.oam_second_write ^= 1;
+      return ret;
+    }
+    case 0x39: case 0x3a: {
+      uint16_t v = g_hw.vram_read_buffer;
+      if ((adr == 0x3a) == (g_hw.vram_increment_on_high != 0)) {
+        g_hw.vram_read_buffer = g_hw.vram[vram_remap() & 0x7fff];
+        g_hw.vram_pointer += g_hw.vram_increment;
+      }
+      return adr == 0x39 ? (uint8_t)v : v >> 8;
+    }
+    case 0x3b: {
+      uint8_t ret;
+      if (!g_hw.cgram_second_write) ret = g_hw.cgram[g_hw.cgram_pointer] & 0xff;
+      else ret = (g_hw.cgram[g_hw.cgram_pointer++] >> 8) & 0x7f;
+      g_hw.cgram_second_write ^= 1;
+      return ret;
+    }
+    case 0x3e: return 0x01;   // PPU1 version
+    case 0x3f: return 0x01;   // PPU2 version, NTSC
+    default: return g_hw.open_bus;
+  }
+}
+
+// ---- the APU's port 0 (see snes_hw.h) ----
+
+enum { APU_IPL_READY, APU_IPL_TRANSFER, APU_DRIVER_STARTING, APU_DRIVER };
+
+// The SPC700 sees a write to port 0 some time after the CPU makes it, after
+// the rest of a 16-bit write too, so a write is acted on at the next read.
+static void apu_update(void) {
+  if (!g_hw.apu_pending) {
+    if (g_hw.apu_state == APU_DRIVER_STARTING) {
+      // The driver's first act is to clear port 0.
+      g_hw.apu_out[0] = 0;
+      g_hw.apu_state = APU_DRIVER;
+    }
+    return;
+  }
+  g_hw.apu_pending = 0;
+  uint8_t v = g_hw.apu_in[0];
+  switch (g_hw.apu_state) {
+    case APU_IPL_READY:
+      if (v == 0xcc) {
+        g_hw.apu_out[0] = 0xcc;
+        g_hw.apu_state = APU_IPL_TRANSFER;
+        g_hw.apu_counter = 0;
+      }
+      break;
+    case APU_IPL_TRANSFER:
+      g_hw.apu_out[0] = v;
+      if (v == g_hw.apu_counter) {
+        g_hw.apu_counter++;        // a data byte
+      } else if (g_hw.apu_in[1] == 0) {
+        g_hw.apu_state = APU_DRIVER_STARTING;   // jump to the uploaded code
+      } else {
+        g_hw.apu_counter = 0;      // the next block
+      }
+      break;
+    default:
+      g_hw.apu_out[0] = v;
+      g_hw.apu_state = APU_DRIVER;
+      break;
+  }
+}
+
+// ---- the B bus: PPU, APU ports, WRAM port ----
+
+static void bbus_write(uint8_t adr, uint8_t val) {
+  if (adr < 0x40) {
+    ppu_write(adr, val);
+  } else if (adr < 0x80) {
+    g_hw.apu_in[adr & 3] = val;
+    if ((adr & 3) == 0) g_hw.apu_pending = 1;
+  } else if (adr == 0x80) {
+    g_wram[g_hw.wram_adr] = val;
+    g_hw.wram_adr = (g_hw.wram_adr + 1) & 0x1ffff;
+  } else if (adr == 0x81) {
+    g_hw.wram_adr = (g_hw.wram_adr & 0x1ff00) | val;
+  } else if (adr == 0x82) {
+    g_hw.wram_adr = (g_hw.wram_adr & 0x100ff) | val << 8;
+  } else if (adr == 0x83) {
+    g_hw.wram_adr = (g_hw.wram_adr & 0x0ffff) | (uint32_t)(val & 1) << 16;
+  }
+}
+
+static uint8_t bbus_read(uint8_t adr) {
+  if (adr < 0x40) return ppu_read(adr);
+  if (adr < 0x80) {
+    apu_update();
+    return g_hw.apu_out[adr & 3];
+  }
+  if (adr == 0x80) {
+    uint8_t v = g_wram[g_hw.wram_adr];
+    g_hw.wram_adr = (g_hw.wram_adr + 1) & 0x1ffff;
+    return v;
+  }
+  return g_hw.open_bus;
+}
+
+// ---- DMA ----
+
+static const uint8_t kBAdrOffsets[8][4] = {
+  {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 0, 0, 0}, {0, 0, 1, 1},
+  {0, 1, 2, 3}, {0, 1, 0, 1}, {0, 0, 0, 0}, {0, 0, 1, 1},
+};
+
+static void do_dma(uint8_t channels) {
+  for (int c = 0; c < 8; c++) {
+    if (!(channels & (1 << c))) continue;
+    uint8_t *r = g_hw.dma[c];
+    uint8_t mode = r[0] & 7, b_adr = r[1];
+    bool from_b = r[0] & 0x80, fixed = r[0] & 0x08, decrement = r[0] & 0x10;
+    uint16_t a_adr = r[2] | r[3] << 8;
+    uint32_t a_bank = (uint32_t)r[4] << 16;
+    uint32_t size = r[5] | r[6] << 8;
+    if (size == 0) size = 0x10000;
+    int off = 0;
+    while (size--) {
+      uint8_t b = (uint8_t)(b_adr + kBAdrOffsets[mode][off++]);
+      off &= 3;
+      if (from_b) wr8(a_bank | a_adr, bbus_read(b));
+      else bbus_write(b, rd8(a_bank | a_adr));
+      if (!fixed) a_adr += decrement ? -1 : 1;
+    }
+    r[2] = (uint8_t)a_adr;
+    r[3] = a_adr >> 8;
+    r[5] = r[6] = 0;
+  }
+}
+
+// ---- CPU registers ----
+
+static void cpu_reg_write(uint16_t adr, uint8_t val) {
+  switch (adr) {
+    case 0x4200: g_hw.nmitimen = val; break;
+    case 0x4202: g_hw.multiply_a = val; break;
+    case 0x4203: g_hw.multiply_result = (uint16_t)(g_hw.multiply_a * val); break;
+    case 0x4204: g_hw.divide_a = (g_hw.divide_a & 0xff00) | val; break;
+    case 0x4205: g_hw.divide_a = (uint16_t)((g_hw.divide_a & 0x00ff) | val << 8); break;
+    case 0x4206:
+      if (val == 0) {
+        g_hw.divide_result = 0xffff;
+        g_hw.multiply_result = g_hw.divide_a;
+      } else {
+        // 16-bit by 8-bit, by shifts: the ARM7 has no divide instruction.
+        uint32_t q = 0, r = 0;
+        for (int i = 15; i >= 0; i--) {
+          r = (r << 1) | ((g_hw.divide_a >> i) & 1);
+          if (r >= val) { r -= val; q |= 1u << i; }
+        }
+        g_hw.divide_result = (uint16_t)q;
+        g_hw.multiply_result = (uint16_t)r;
+      }
+      break;
+    case 0x420b: do_dma(val); break;
+    case 0x420c: g_hw.hdmaen = val; break;
+    default:
+      if (adr >= 0x4300 && adr < 0x4380) g_hw.dma[(adr >> 4) & 7][adr & 0xf] = val;
+      break;
+  }
+}
+
+static uint8_t cpu_reg_read(uint16_t adr) {
+  switch (adr) {
+    case 0x4210: {
+      uint8_t v = (uint8_t)(0x02 | g_hw.in_nmi << 7);
+      g_hw.in_nmi = 0;
+      return v;
+    }
+    case 0x4211: return 0;
+    case 0x4212: return 0x80;  // in VBlank, auto-joypad done (see snes_hw.h)
+    case 0x4214: return (uint8_t)g_hw.divide_result;
+    case 0x4215: return g_hw.divide_result >> 8;
+    case 0x4216: return (uint8_t)g_hw.multiply_result;
+    case 0x4217: return g_hw.multiply_result >> 8;
+    case 0x4218: case 0x421a: case 0x421c: case 0x421e: return (uint8_t)g_hw.joy[(adr - 0x4218) >> 1];
+    case 0x4219: case 0x421b: case 0x421d: case 0x421f: return g_hw.joy[(adr - 0x4219) >> 1] >> 8;
+    default:
+      if (adr >= 0x4300 && adr < 0x4380) return g_hw.dma[(adr >> 4) & 7][adr & 0xf];
+      return g_hw.open_bus;
+  }
+}
+
+// ---- the memory map (HiROM) ----
+
+uint8_t rd8(uint32_t a) {
+  uint8_t bank = a >> 16;
+  uint16_t lo = (uint16_t)a;
+  uint8_t v;
+  if ((bank & 0xfe) == 0x7e) return g_wram[a & 0x1ffff];
+  if ((bank & 0x7f) < 0x40) {
+    if (lo < 0x2000) return g_wram[lo];
+    if (lo >= 0x8000) return g_rom[(((uint32_t)(bank & 0x3f) << 16) | lo) & g_rom_mask];
+    if (lo >= 0x6000) v = g_sram[(((bank & 0x3f) << 13) | (lo & 0x1fff)) & 0x7ff];
+    else if (lo == 0x4016) v = serial_read(0) | (g_hw.open_bus & 0xfc);
+    else if (lo == 0x4017) v = serial_read(1) | (g_hw.open_bus & 0xe0) | 0x1c;
+    else if (lo >= 0x2100 && lo < 0x2200) v = bbus_read((uint8_t)lo);
+    else if (lo >= 0x4200 && lo < 0x4400) v = cpu_reg_read(lo);
+    else v = g_hw.open_bus;
+    g_hw.open_bus = v;
+    return v;
+  }
+  return g_rom[(((uint32_t)(bank & 0x3f) << 16) | lo) & g_rom_mask];
+}
+
+void wr8(uint32_t a, uint8_t v) {
+  uint8_t bank = a >> 16;
+  uint16_t lo = (uint16_t)a;
+  if ((bank & 0xfe) == 0x7e) { g_wram[a & 0x1ffff] = v; return; }
+  if ((bank & 0x7f) < 0x40) {
+    if (lo < 0x2000) g_wram[lo] = v;
+    else if (lo >= 0x6000 && lo < 0x8000) g_sram[(((bank & 0x3f) << 13) | (lo & 0x1fff)) & 0x7ff] = v;
+    else if (lo >= 0x2100 && lo < 0x2200) bbus_write((uint8_t)lo, v);
+    else if (lo >= 0x4200 && lo < 0x4400) cpu_reg_write(lo, v);
+    else if (lo == 0x4016) {
+      g_hw.strobe = v & 1;
+      if (g_hw.strobe) {
+        g_hw.serial[0] = serial_order(g_hw.joy1_now);
+        g_hw.serial[1] = 0;
+      }
+    }
+  }
+}

@@ -668,7 +668,9 @@ def main():
         if i.mnem in ("JSR", "JSL", "WAI") and i.next in insns:
             entries.add(i.next)
         t = static_target(i)
-        if t is not None and t in insns and insns[t].region != i.region:
+        if t is not None and t in insns and (insns[t].region != i.region or t <= i.addr):
+            # Other regions jump there; or a backward branch, whose POLL can
+            # return there for an interrupt.
             entries.add(t)
     entries |= set(t for t in dyn_targets if t in insns)
 

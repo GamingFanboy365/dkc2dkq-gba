@@ -51,4 +51,14 @@ if(DKC2_ROM)
   target_include_directories(hostrun PRIVATE src host ${GEN})
   set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-w")
   target_link_libraries(hostrun lakesnes toolcommon)
+
+  # The same code on the port's own hardware model, the GBA's.
+  add_library(gen_budget OBJECT ${GEN_SOURCES})
+  target_include_directories(gen_budget PRIVATE src src/budget ${GEN})
+  target_compile_definitions(gen_budget PRIVATE CHECK_ASSUMPTIONS)
+  add_executable(hostmini host/hostmini.c src/runtime.c src/snes_hw.c src/game_loop.c
+                 $<TARGET_OBJECTS:gen_budget>)
+  target_include_directories(hostmini PRIVATE src src/budget)
+  target_compile_definitions(hostmini PRIVATE CHECK_ASSUMPTIONS)
+  target_link_libraries(hostmini toolcommon)
 endif()
