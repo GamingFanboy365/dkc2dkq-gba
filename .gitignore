@@ -17,3 +17,4 @@ DMA_log*
 *.avi
 *.sox
 *.trace
+build*/

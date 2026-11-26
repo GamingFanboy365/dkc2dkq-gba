@@ -8,8 +8,12 @@
 // SHOTS=F1,F2     save the picture at these frames (shot_FFFFF.png, 256x224)
 // DUMPS=F1,F2     save WRAM (wram_FFFFF.bin), VRAM, CGRAM, OAM at these frames
 // TRACE=FILE      write what the CPU did, for the recompiler (see below)
-// SYNC=FILE       write a line per frame: frame, hash of WRAM when the game
-//                 first waits (WAI) in that frame, and the WAI's address
+// SYNC=FILE       write a line per NMI, at the first WAI after it: frame, hash
+//                 of WRAM (less active_frame_counter, $2C, which counts every
+//                 NMI, lag frames too), and the WAI's address. (The game's
+//                 IRQ handler is SEI/RTI; IRQs wake WAI loops many times a
+//                 frame without doing anything, so they aren't counted.)
+// WAIT_DUMPS=N,.. with SYNC, save WRAM at the Nth line's WAI (waitwram_N.bin)
 //
 // A frame ends when the SNES enters VBlank. Pictures and dumps are taken
 // then, after the frame's NMI has been requested but before it runs.
@@ -73,12 +77,20 @@ static bool is_dynamic_transfer(uint8_t op) {
 static Snes *g_snes;
 static int g_frame;
 static FILE *g_sync;
-static bool g_sync_done_this_frame;
+static int g_num_waits, g_wait_dumps[4096], g_num_wait_dumps;
+static bool g_nmi_since_wait = true;
+static const char *g_out_dir = ".";
 
+// WRAM's hash for SYNC, less active_frame_counter ($7E002C).
 static uint32_t hash_ram(const uint8_t *p, size_t n) {
   uint32_t h = 2166136261u;
-  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+  for (size_t i = 0; i < n; i++) h = (h ^ (i == 0x2c || i == 0x2d ? 0 : p[i])) * 16777619u;
   return h;
+}
+
+// Reads ROM without touching the clock (cpu->read is the timed bus access).
+static uint8_t peek_rom(uint32_t pc) {
+  return snes_read(g_snes, pc);
 }
 
 static void trace_hook(Cpu *cpu) {
@@ -97,17 +109,24 @@ static void trace_hook(Cpu *cpu) {
   bt->flags[lo] |= f;
   if (g_prev_pc != 0xffffffff && is_dynamic_transfer(g_prev_op)) add_edge(g_prev_pc, pc);
   g_prev_pc = pc;
-  g_prev_op = cpu->read(cpu->mem, pc);
+  g_prev_op = peek_rom(pc);
 }
 
-// Called for every opcode when SYNC is on: notes the first WAI of a frame.
+// Called for every opcode when SYNC is on: notes each WAI.
 static void sync_hook(Cpu *cpu) {
-  if (g_bank_trace[0] || cpu_traceHook == trace_hook) {}
   uint32_t pc = (uint32_t)cpu->k << 16 | cpu->pc;
-  uint8_t op = cpu->read(cpu->mem, pc);
-  if (op == 0xCB && !g_sync_done_this_frame) {
+  uint16_t nmi_vector = snes_read(g_snes, 0xffea) | snes_read(g_snes, 0xffeb) << 8;
+  if (cpu->k == 0 && cpu->pc == nmi_vector) g_nmi_since_wait = true;
+  uint8_t op = peek_rom(pc);
+  if (op == 0xCB && g_nmi_since_wait) {
+    g_nmi_since_wait = false;
     fprintf(g_sync, "%d %08x %06x\n", g_frame, hash_ram(g_snes->ram, sizeof(g_snes->ram)), pc);
-    g_sync_done_this_frame = true;
+    if (int_list_has(g_wait_dumps, g_num_wait_dumps, g_num_waits)) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/waitwram_%d.bin", g_out_dir, g_num_waits);
+      write_file(path, g_snes->ram, sizeof(g_snes->ram));
+    }
+    g_num_waits++;
   }
 }
 
@@ -190,6 +209,8 @@ int main(int argc, char **argv) {
   if (!keyscript_parse(&keys, getenv("KEYS"))) { fprintf(stderr, "bad KEYS\n"); return 1; }
   const char *trace_path = getenv("TRACE");
   if (getenv("SYNC")) g_sync = fopen(getenv("SYNC"), "w");
+  g_num_wait_dumps = parse_int_list(getenv("WAIT_DUMPS"), g_wait_dumps, 4096);
+  g_out_dir = out;
 
   Snes *snes = g_snes = snes_init();
   if (!snes_loadRom(snes, rom, (int)rom_size)) { fprintf(stderr, "cannot load the ROM\n"); return 1; }
@@ -199,7 +220,6 @@ int main(int argc, char **argv) {
 
   for (g_frame = 0; g_frame < frames; g_frame++) {
     set_joypad(snes, keyscript_at(&keys, g_frame));
-    g_sync_done_this_frame = false;
     snes_runFrame(snes);
     if (int_list_has(shots, num_shots, g_frame)) save_shot(snes, out, g_frame);
     if (int_list_has(dumps, num_dumps, g_frame)) save_dump(snes, out, g_frame);

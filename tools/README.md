@@ -1,8 +1,9 @@
 # Tools
 
-Host tools for the port. Build them with the top-level CMake project or by hand:
+Host tools for the port. Build them with the top-level CMake project:
 
-    gcc -O2 -o snesrun tools/snesrun.c tools/common/tool_common.c third_party/lakesnes/*.c -lpng -lm
+    cmake -S . -B build -DDKC2_ROM=baserom.sfc -DASAR=/path/to/asar
+    cmake --build build -j4
 
 - `snesrun.c`: runs the original ROM on LakeSnes (the reference), headless:
   pictures, memory dumps, a per-frame RAM hash at the frame's first WAI, and
@@ -10,3 +11,20 @@ Host tools for the port. Build them with the top-level CMake project or by hand:
   the top of the file.
 - `strip_rom_data.py`: the one-time conversion that took the game's data out
   of the disassembly (incbins from `baserom.sfc` instead).
+- `recomp/`: the static recompiler. `asm_probe.py` asks asar where every
+  instruction and label of the disassembly is; `recomp.py` decodes them from
+  the ROM, works out the M/X widths, corrects the disassembly where the trace
+  shows it decoded bytes at the wrong width, and writes C (one function per
+  routine) for `src/cpu65.h`'s runtime. Its output is built from the ROM and
+  never committed.
+- `compare_sync.py`: compares the per-frame WRAM hashes of the reference
+  (`snesrun SYNC=`) and the recompiled build (`hostrun SYNC=`).
+
+The recompiled game on the PC is `host/hostrun.c`. A check run:
+
+    FRAMES=3000 SYNC=ref.sync build/snesrun baserom.sfc
+    FRAMES=3000 SYNC=host.sync build/hostrun baserom.sfc
+    tools/compare_sync.py ref.sync host.sync
+
+`traces/` holds the reference's CPU traces (`snesrun TRACE=`): addresses
+and flags only, no game data.
