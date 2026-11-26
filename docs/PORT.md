@@ -43,6 +43,11 @@ code or a cartridge.
   tiles in front of BG1 (the lights on the world map's sign), color math
   that adds the sub screen to two layers at once (the mist over the
   island), subtracting, HDMA changing Mode 7's matrix.
+- **Known weak spot**: where no trace has run the code, the recompiler
+  keeps the disassembly's instruction boundaries, and the disassembly
+  decodes some bytes at the wrong register width (as at $B5F74B, where
+  the native version does what the SNES does). Such code is wrong until a
+  trace covers it.
 - **Not yet**: sound (the sound CPU only answers handshakes); saves; only
   the first level is verified (code the traces haven't seen run may have
   entries or register widths the recompiler doesn't know).
@@ -55,7 +60,7 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 |---|---|---|---|
 | First build | 1,530,000 | 920,000 | 2,450,000 (8.7 frames) |
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
-| Now | 417,000 | 385,000 | 800,000 (2.9 frames) |
+| Now | 400,000 | 385,000 | 785,000 (2.8 frames) |
 
 (Measured over game frames 2340-2399 of the play session, in the level; an
 earlier "315,000 for drawing" was a quieter stretch.)
@@ -69,7 +74,8 @@ show changes, VRAM's dirty bits, hot loops as ARM in IWRAM, a 32-column
 map's row drawn once whatever each line's scroll, HDMA run on a copy of
 its state in IWRAM, the recompiled code as Thumb (half the ROM fetches), and native C for
 the hottest routines (`src/native.c`: the objects' sprites into OAM, the
-levels' parallax tables, the sort of the objects by drawing order).
+levels' parallax tables, the sort of the objects by drawing order, the
+levels' tiled objects' sprites).
 What's left: the game's own logic (the recompiled code:
 about 60%: executing it, not its memory: it makes only ~5,000 WRAM
 accesses a frame, half in the direct page and stack), the map rows, HDMA. IWRAM (32 KB) and EWRAM (256 KB, half of

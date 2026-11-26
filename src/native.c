@@ -12,6 +12,7 @@
 uint32_t R_b59f40_recomp(uint32_t entry);
 uint32_t R_80e580_recomp(uint32_t entry);
 uint32_t R_b5a8da_recomp(uint32_t entry);
+uint32_t R_b5f5e1_recomp(uint32_t entry);
 
 // The direct page (D = 0, bank 0), absolute with DB = $B5, long.
 static inline uint8_t d8(uint16_t a) { return rd8_b0(a); }
@@ -401,4 +402,191 @@ uint32_t R_b5a8da(uint32_t entry) {
   uint16_t r = pull16();
   uint32_t b = pull8();
   return b << 16 | (uint16_t)(r + 1);
+}
+
+// ---- CODE_B5F5E1: a level object's tiles into OAM, through the WRAM port ----
+//
+// For the object at X in $7FA630's table: which of its tile rows the
+// screen shows, then for each set bit of each row's mask, a sprite: four
+// bytes written through $2180 (WRAM's port, at OAM's address) and two bits
+// of the high table gathered in $4A, stored every fourth sprite. Returns
+// with carry set when done, or with $70 = $0400 when OAM is full.
+//
+// Unlike the recompiled code (whose width there comes from the
+// disassembly), the bytes at $B5F74B run as LDA #$80; STA $4A, as on the
+// SNES (with A 8-bit, as at $B5F6E9).
+
+static inline uint16_t adc16v(uint16_t a, uint16_t b, uint8_t *c, uint8_t *v) {
+  uint32_t r = (uint32_t)a + b + *c;
+  *v = ((~(a ^ b) & (a ^ r)) >> 15) & 1;
+  *c = (r >> 16) & 1;
+  return (uint16_t)r;
+}
+static inline uint16_t sbc16v(uint16_t a, uint16_t b, uint8_t *c, uint8_t *v) {
+  return adc16v(a, (uint16_t)~b, c, v);
+}
+static inline uint8_t adc8v(uint8_t a, uint8_t b, uint8_t *c, uint8_t *v) {
+  uint32_t r = (uint32_t)a + b + *c;
+  *v = ((~(a ^ b) & (a ^ r)) >> 7) & 1;
+  *c = (r >> 8) & 1;
+  return (uint8_t)r;
+}
+
+static uint32_t b5f5e1_rts(uint16_t a, uint16_t x, uint16_t y, uint8_t c, uint8_t v, uint8_t n, uint8_t z) {
+  cpu.a = a;
+  cpu.x = x;
+  cpu.y = y;
+  cpu.c = c;
+  cpu.v = v;
+  cpu.n = n;
+  cpu.z = z;
+  cpu.mf = 0;
+  cpu.xf = 0;
+  uint16_t r = pull16();
+  return (uint32_t)cpu.pb << 16 | (uint16_t)(r + 1);
+}
+
+uint32_t R_b5f5e1(uint32_t entry) {
+  if (entry != 0xb5f5e1 || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf || cpu.db != 0xb5)
+    return R_b5f5e1_recomp(entry);
+  uint16_t x = cpu.x, y, a;
+  uint8_t c = 1, v = cpu.v;
+  // Its rows' mask, by its height on screen
+  a = sbc16v(rd16(0x7fa634 + x), b16(0x17c0), &c, &v);
+  s16(0x3e, a);
+  if (!c) {
+    a = adc16v(a, 0x008f, &c, &v);
+    y = (uint16_t)((a >> 3) << 1);
+    a = b16(0xfaa2 + y);
+  } else {
+    y = 0;
+    a = sbc16v(a, 0x0060, &c, &v);
+    if (c) y = (uint16_t)((a >> 3) << 1);
+    a = b16(0xfac4 + y);
+  }
+  s16(0x40, a);
+  // Its columns, by its place across the screen
+  c = 1;
+  a = sbc16v(rd16(0x7fa632 + x), b16(0x17ba), &c, &v);
+  s16(0x3c, a);
+  bool clipped = c;
+  if (!clipped) {
+    a = adc16v(a, 0x000f, &c, &v);
+    if (c) clipped = true;
+  }
+  if (!clipped) {
+    a = adc16v(a, rd16(0x7fa638 + x), &c, &v);
+    a = (uint16_t)((a >> 3) << 1);
+    s16(0x32, a);
+    c = 1;
+    a = sbc16v(rd16(0x7fa636 + x), d16(0x32), &c, &v);
+    y = a;
+    c = 0;
+    a = adc16v(a, rd16(0x7fa63c + x), &c, &v);
+    s16(0x39, a);
+    c = (y >> 14) & 1;   // TYA; ASL; ASL
+    a = adc16v((uint16_t)(y << 2), d16(0x3c), &c, &v);
+    s16(0x3c, a);
+  } else {
+    c = 1;
+    a = sbc16v(0x0107, d16(0x3c), &c, &v);
+    a = (uint16_t)((a >> 3) << 1);
+    uint16_t w = rd16(0x7fa636 + x);
+    c = a >= w;   // CMP
+    if (c) a = w;
+    s16(0x32, a);
+    a = rd16(0x7fa63c + x);
+    s16(0x39, a);
+  }
+  // Its palette row, from the frame counter and its place
+  {
+    uint16_t t = (uint16_t)((d16(0x2a) >> 1) << 1);
+    c = (t >> 15) & 1;
+    a = adc16v((uint16_t)(t << 1), rd16(0x7fa632 + x), &c, &v);
+    c = 0;
+    a = adc16v(a, rd16(0x7fa634 + x), &c, &v);
+    c = (a >> 1) & 1;
+    a >>= 2;
+    c = 0;
+    a = adc16v(a, d16(0x39), &c, &v);
+    c = 1;
+    a = sbc16v(a, rd16(0x7fa63c + x), &c, &v);
+    a = (uint16_t)((a & 0x000e) | b16(0x0d2c));
+    s16(0x42, a);
+  }
+  // SEP #$10: X and Y 8-bit
+  x &= 0xff;
+  y = d8(0x32);
+  s16(0x3e, (uint16_t)(d16(0x3e) - 1));
+  uint32_t p39 = ptr24(0x39);
+  for (;;) {
+    // CODE_B5F687
+    y = (uint8_t)(y - 2);
+    if (y & 0x80) return b5f5e1_rts(a, x, y, 1, v, 1, 0);   // CODE_B5F67D: done
+    a = (uint16_t)(ind16(p39, y) & d16(0x40));
+    if (!a) continue;
+    a = (uint16_t)(a >> 8 | a << 8);
+    push16(a);
+    x = pull8();
+    // Two passes: the row's mask's first byte, then its second
+    for (int pass = x ? 0 : 1; pass < 2; pass++) {
+      if (pass == 1) {
+        // CODE_B5F6F6
+        x = pull8();
+        if (!x) break;
+      }
+      uint32_t tbl = pass ? 0xb5fda8 : 0xb5fca8;
+      do {
+        // CODE_B5F696 / CODE_B5F6F9
+        c = 0;
+        uint16_t w = adc16v(d16(0x3c), b16(0xfb66 + y), &c, &v);
+        c = 1;   // SEP #$21
+        wr8(0xb52180, (uint8_t)w);
+        wr8(0xb52180, adc8v(d8(0x3e), rd8(tbl + x), &c, &v));
+        uint8_t t = rd8(tbl + x);
+        c = (t >> 1) & 1;
+        t >>= 2;
+        t = adc8v(t, rd8(0xb5fb26 + y), &c, &v);
+        t &= 0x0e;
+        t = adc8v(t, d8(0x42), &c, &v);
+        t &= 0xee;
+        wr8(0xb52180, t);
+        wr8(0xb52180, d8(0x43));
+        // XBA; ASL: the X position's ninth bit; into $4A with a size bit
+        c = (w >> 15) & 1;
+        uint8_t q = d8(0x4a);
+        uint8_t out = q & 1;
+        q = (uint8_t)(q >> 1 | c << 7);
+        c = out;
+        out = q & 1;
+        q = (uint8_t)(q >> 1 | 0x80);
+        c = out;
+        a = (uint16_t)((uint16_t)d8(0x43) << 8 | q);
+        if (c) {
+          // A byte of the high table full: stored, every fourth sprite
+          push8((uint8_t)x);
+          uint8_t k = d8(0x38);
+          wr8(0xb503a0 + k, q);
+          uint8_t k1 = (uint8_t)(k + 1);
+          s8(0x38, k1);
+          if (k1 & 0x80) {
+            // OAM is full
+            if (pass == 0) {
+              pull16();   // CODE_B5F6D5: PLA (the byte left by PHA/PLX and X)
+            } else {
+              k = (uint8_t)pull8();   // CODE_B5F739: PLX
+            }
+            s16(0x70, 0x0400);
+            return b5f5e1_rts(0x0400, k, y, 1, v, 0, 0);   // X: $38 before the INC, or the PLX'd X
+          }
+          s8(0x4a, 0x80);
+          x = pull8();
+        } else {
+          s8(0x4a, q);
+        }
+        a = rd16(0xb5fba8 + x);
+        x = a & 0xff;
+      } while (x);
+    }
+  }
 }

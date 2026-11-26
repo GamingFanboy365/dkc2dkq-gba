@@ -48,6 +48,9 @@ if(DKC2_ROM)
             --probe-cache ${CMAKE_BINARY_DIR}/probe.json ${TRACE_ARGS}
     DEPENDS ${RECOMP} ${ASM} ${TRACES}
     COMMENT "Recompiling the game's code from the ROM")
+  # One target runs it: targets sharing a custom command's outputs could
+  # each run it in a parallel build, over each other.
+  add_custom_target(recompiled DEPENDS ${GEN_SOURCES} ${GEN}/regions.h)
   # Native versions of some routines (their recompiled code's names): built
   # as the recompiled code is.
   list(APPEND GEN_SOURCES ${CMAKE_SOURCE_DIR}/src/native.c)
@@ -58,6 +61,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   # ---- the GBA ----
   set(GBA_FLAGS -mthumb -O2 -Wall -Wno-unused-label)
   add_executable(dkc2.elf gba/crt0.S gba/main.c gba/render.c gba/debug.c gba/libc.c ${PORT_SOURCES} ${GEN_SOURCES})
+  add_dependencies(dkc2.elf recompiled)
   target_include_directories(dkc2.elf PRIVATE gba/include gba src ${GEN})
   target_compile_options(dkc2.elf PRIVATE $<$<COMPILE_LANGUAGE:C>:${GBA_FLAGS}>)
   target_compile_definitions(dkc2.elf PRIVATE "EWRAM_DATA=__attribute__((section(\".ewram_bss\")))")
@@ -118,12 +122,14 @@ target_link_libraries(snesrun lakesnes toolcommon)
 if(DKC2_ROM)
   # The recompiled code on LakeSnes's hardware.
   add_executable(hostrun host/hostrun.c src/runtime.c ${GEN_SOURCES})
+  add_dependencies(hostrun recompiled)
   target_include_directories(hostrun PRIVATE src host ${GEN})
   set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-w")
   target_link_libraries(hostrun lakesnes toolcommon)
 
   # The same code on the port's own hardware model, the GBA's.
   add_library(gen_budget OBJECT ${GEN_SOURCES})
+  add_dependencies(gen_budget recompiled)
   target_include_directories(gen_budget PRIVATE src src/budget ${GEN})
   target_compile_definitions(gen_budget PRIVATE CHECK_ASSUMPTIONS)
   add_executable(hostmini host/hostmini.c ${PORT_SOURCES} $<TARGET_OBJECTS:gen_budget>)
