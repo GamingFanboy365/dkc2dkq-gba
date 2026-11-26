@@ -6,8 +6,8 @@
 //   GBA BG0-2 (the GBA's lower-numbered layer wins a tie, as BG1 should).
 //   Other modes (Mode 7: the Rareware logo) aren't drawn yet.
 // - Tiles: converted from SNES planar to GBA packed 4bpp on demand, into a
-//   cache of GBA tile slots: 1024 for BG1/BG2 (charblocks 0-1), 575 for BG3,
-//   widened to 4bpp (charblock 2 and part of 3). VRAM's write counters say
+//   cache of GBA tile slots, a pool per SNES BG over 1790 slots (see
+//   NUM_SLOTS), BG3's 2bpp tiles widened to 4bpp. VRAM's write counters say
 //   when a cached tile went stale.
 // - Maps: only what the 240x160 window shows, a tile row at a time at that
 //   row's scroll; each GBA cell is rewritten only when the SNES map entry it
@@ -77,16 +77,21 @@ void render_set_view(int top, int lines) {
 #define OBJ_PALETTE ((volatile uint16_t *)0x05000200)
 #define OAM ((volatile uint16_t *)0x07000000)
 
-#define POOL_A_SLOTS 1024             // charblocks 0-1
-#define POOL_B_BASE 0x8000            // charblock 2
-#define POOL_B_SLOTS 576              // to 0xC800; the last is the fixed color's tile
-#define PLANE_SLOT (POOL_B_SLOTS - 1)
-#define EMPTY_SLOT_B (POOL_B_SLOTS - 2)   // a transparent tile, for cells left out
-#define PLANE_SCREENBLOCK 25          // 0xC800: the fixed color's map
+// BG VRAM: 1792 tile slots of 32 bytes (0x0000-0xDFFF), then the maps.
+// Each SNES BG has its own pool of slots and a GBA char base, so it can
+// address 1024 of them: BG1 slots 0-1023 (charblock 0), BG2 512-1535
+// (charblock 1), BG3 1024-1789 (charblock 2). The fixed color's plane
+// uses charblock 3.
+#define NUM_SLOTS 1792
+#define EMPTY_SLOT 1790               // a transparent tile, for cells left out
+#define PLANE_SLOT 1791               // color 15 everywhere: the fixed color's
+#define PLANE_SCREENBLOCK 28          // 0xE000: the fixed color's map
 #define SCREENBLOCK(n) ((volatile uint16_t *)(0x06000000 + (n) * 0x800))
-#define FIRST_SCREENBLOCK 26          // 26-28: the three BGs' maps
+#define FIRST_SCREENBLOCK 29          // 29-31: the three BGs' maps
 
 // ---- what the VBlank interrupt puts on screen ----
+
+#define MAX_LINE_COLORS 4             // CGRAM entries HDMA may rewrite, followed
 
 typedef struct {
   uint16_t oam[128 * 4];
@@ -94,7 +99,17 @@ typedef struct {
   uint16_t scroll[LINES + 2][8];   // per line: BG0-3 HOFS, VOFS; line 0 twice, a spare at the end
   uint16_t fixed[LINES + 2];       // per line: the SNES's fixed color, the same way
   uint16_t dispcnt, bgcnt[4], bldcnt, bldalpha;
-  bool per_line_scroll, per_line_fixed;
+  bool per_line_scroll, per_line_fixed, per_line_regs;
+  // Per line, when the layers or color math change down the screen
+  // (per_line_regs): DISPCNT, BLDCNT, BLDALPHA, the three BGs' priorities
+  // (2 bits each, for BG0-2CNT), and the colors HDMA rewrites (each in GBA
+  // palette entries pal_index[k][0] and, if not 0, [1]), set by the HBlank
+  // interrupt.
+  uint16_t line_regs[LINES][4];
+  uint16_t bgcnt_base[3];
+  uint8_t num_line_colors;
+  uint16_t pal_index[MAX_LINE_COLORS][2];
+  uint16_t line_pal[LINES][MAX_LINE_COLORS];
   uint32_t palette_key;            // CGRAM's write count and the brightness it was made for
 } Frame;
 
@@ -112,23 +127,56 @@ static int g_shown;                    // the frame on screen
 
 static uint32_t g_expand[256];          // a bitplane byte -> a bit in each pixel's nibble
 
+// The order a pool takes free slots in: segments of slots counting up
+// (step 1) or down (-1) from `first`. Each fills from its own end toward
+// the slots it shares with its neighbors, so they meet only on screens that
+// need most of them. A slot is free when no map cell shows it (it may still
+// cache a tile); a pool takes the first free one in its order.
+typedef struct {
+  int16_t first, count, step;
+} Segment;
+
 typedef struct {
   uint16_t *slot_of;   // per SNES tile: slot + 1, or 0
-  uint16_t *owner;     // per slot: SNES tile + 1, or 0
-  uint16_t *refs;      // per slot: map cells showing it
-  uint16_t nslots, cursor;
-  uint32_t base;       // byte offset in BG VRAM
-  uint8_t shift;       // SNES tile index = word address >> shift
+  Segment seg[2];
+  uint16_t hint;       // the slots before this place in the order aren't free
+  uint16_t index_base; // the slot a GBA map's tile 0 is (its char base)
+  uint8_t id, shift;   // SNES tile index = word address >> shift
   uint32_t full;       // times no slot was free
 } Pool;
 
-EWRAM_DATA static uint16_t g_slot_a[2048], g_owner_a[POOL_A_SLOTS], g_refs_a[POOL_A_SLOTS];
-EWRAM_DATA static uint16_t g_slot_b[4096], g_owner_b[POOL_B_SLOTS], g_refs_b[POOL_B_SLOTS];
-static Pool g_pool_a = {g_slot_a, g_owner_a, g_refs_a, POOL_A_SLOTS, 0, 0, 4, 0};
-static Pool g_pool_b = {g_slot_b, g_owner_b, g_refs_b, EMPTY_SLOT_B, 0, POOL_B_BASE, 3, 0};
+// Per slot: the pool and SNES tile it holds ((id << 13 | tile) + 1, or 0),
+// and the map cells showing it.
+EWRAM_DATA static uint16_t g_owner[NUM_SLOTS], g_refs[NUM_SLOTS];
+EWRAM_DATA static uint16_t g_slot_of[3][4096];
+static Pool g_pools[3] = {
+  {g_slot_of[0], {{0, 1024, 1}, {0, 0, 1}}, 0, 0, 0, 4, 0},
+  {g_slot_of[1], {{1024, 512, 1}, {1023, 512, -1}}, 0, 512, 1, 4, 0},
+  {g_slot_of[2], {{1536, 254, 1}, {1535, 512, -1}}, 0, 1024, 2, 3, 0},
+};
+
+static inline uint32_t order_len(const Pool *p) { return (uint32_t)(p->seg[0].count + p->seg[1].count); }
+
+static inline uint32_t slot_at(const Pool *p, uint32_t pos) {
+  const Segment *g = &p->seg[0];
+  if (pos >= (uint32_t)g->count) { pos -= (uint32_t)g->count; g = &p->seg[1]; }
+  return (uint32_t)(g->first + g->step * (int)pos);
+}
+
+// A slot's place in a pool's order, or -1.
+static inline int place_of(const Pool *p, uint32_t slot) {
+  int base = 0;
+  for (int k = 0; k < 2; k++) {
+    const Segment *g = &p->seg[k];
+    int d = ((int)slot - g->first) * g->step;
+    if (d >= 0 && d < g->count) return base + d;
+    base += g->count;
+  }
+  return -1;
+}
 
 IWRAM_CODE static void convert_tile(const Pool *p, uint32_t tile, uint32_t slot) {
-  volatile uint32_t *dst = (volatile uint32_t *)(BG_VRAM + p->base + slot * 32);
+  volatile uint32_t *dst = (volatile uint32_t *)(BG_VRAM + slot * 32);
   const uint16_t *src = &g_hw.vram[(tile << p->shift) & 0x7fff];
   const uint32_t *ex = g_expand;
   if (p->shift == 4) {
@@ -145,39 +193,45 @@ IWRAM_CODE static void convert_tile(const Pool *p, uint32_t tile, uint32_t slot)
 }
 
 // A slot showing SNES tile `tile`, with one more ref; converts the tile if
-// it isn't cached (cached tiles are kept fresh by refresh_dirty).
+// it isn't cached (cached tiles are kept fresh by refresh_dirty). Returns
+// the GBA map's tile index for it.
 static void evict_hidden(void);
 
 IWRAM_CODE static uint32_t acquire(Pool *p, uint32_t tile) {
   uint32_t s = p->slot_of[tile];
   if (s) {
     s--;
-    p->refs[s]++;
-    return s;
+    g_refs[s]++;
+    return s - p->index_base;
   }
   for (int attempt = 0; attempt < 2; attempt++) {
-    uint32_t n = p->nslots, c = p->cursor;
-    for (uint32_t tries = n; tries; tries--) {
-      if (!p->refs[c]) {
-        p->cursor = c + 1 == n ? 0 : c + 1;
-        if (p->owner[c]) p->slot_of[p->owner[c] - 1] = 0;
-        p->owner[c] = (uint16_t)(tile + 1);
-        p->slot_of[tile] = (uint16_t)(c + 1);
-        convert_tile(p, tile, c);
-        p->refs[c] = 1;
-        return c;
-      }
-      c = c + 1 == n ? 0 : c + 1;
+    for (uint32_t pos = p->hint, n = order_len(p); pos < n; pos++) {
+      uint32_t slot = slot_at(p, pos);
+      if (g_refs[slot]) continue;
+      p->hint = (uint16_t)(pos + 1);
+      uint32_t o = g_owner[slot];
+      if (o) g_pools[(o - 1) >> 13].slot_of[(o - 1) & 0x1fff] = 0;
+      g_owner[slot] = (uint16_t)((p->id << 13 | tile) + 1);
+      p->slot_of[tile] = (uint16_t)(slot + 1);
+      convert_tile(p, tile, slot);
+      g_refs[slot] = 1;
+      return slot - p->index_base;
     }
     // Every slot is shown somewhere: free the cells off screen and retry.
     evict_hidden();
   }
   p->full++;
-  return 0;
+  return EMPTY_SLOT - p->index_base < 1024 ? EMPTY_SLOT - p->index_base : 0;
 }
 
-static inline void release(Pool *p, uint32_t slot) {
-  if (p->refs[slot]) p->refs[slot]--;
+// A map cell's tile index -> its slot, one ref less.
+static inline void release(Pool *p, uint32_t index) {
+  uint32_t slot = index + p->index_base;
+  if (slot >= NUM_SLOTS || !g_refs[slot] || --g_refs[slot]) return;
+  for (int i = 0; i < 3; i++) {
+    int pos = place_of(&g_pools[i], slot);
+    if (pos >= 0 && pos < g_pools[i].hint) g_pools[i].hint = (uint16_t)pos;
+  }
 }
 
 // A tile whose VRAM changed: reconverted if cells show it, else dropped
@@ -186,12 +240,19 @@ IWRAM_CODE static void tile_changed(Pool *p, uint32_t tile) {
   uint32_t s = p->slot_of[tile];
   if (!s) return;
   s--;
-  if (p->refs[s]) {
+  if (g_refs[s]) {
     convert_tile(p, tile, s);
   } else {
     p->slot_of[tile] = 0;
-    p->owner[s] = 0;
+    g_owner[s] = 0;
   }
+}
+
+// Empties a pool's cache (its tiles change size); its cells are released.
+static void flush_pool(Pool *p) {
+  for (uint32_t s = 0; s < NUM_SLOTS; s++)
+    if (g_owner[s] && (uint32_t)((g_owner[s] - 1) >> 13) == p->id) g_owner[s] = 0;
+  memset(p->slot_of, 0, sizeof(g_slot_of[0]));
 }
 
 // ---- backgrounds ----
@@ -209,15 +270,51 @@ static uint8_t g_row_col0[3][32];        // the first GBA column shown in each
 static uint16_t g_hofs[3][224], g_vofs[3][224];
 static uint16_t g_fixed_line[224];
 
+// Per SNES line, what HDMA may change besides the scroll: the main and
+// sub screens' layers, color math's settings, and up to MAX_LINE_COLORS
+// CGRAM entries (CGRAM as it was before the frame's HDMA, for lines before
+// an entry's first write).
+static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
+static uint8_t g_hdma_color[MAX_LINE_COLORS], g_num_hdma_colors;
+static uint16_t g_line_color[224][MAX_LINE_COLORS];
+static uint16_t g_cgram_before[256];
+static int g_hdma_line;
+
+static void hdma_write_hook(uint8_t reg, uint8_t value) {
+  (void)value;
+  if (reg != 0x22 || !g_hw.cgram_second_write) return;
+  uint8_t c = g_hw.cgram_pointer;
+  for (int k = 0; k < g_num_hdma_colors; k++)
+    if (g_hdma_color[k] == c) return;
+  if (g_num_hdma_colors == MAX_LINE_COLORS) return;
+  int k = g_num_hdma_colors++;
+  g_hdma_color[k] = c;
+  for (int line = 0; line < g_hdma_line; line++) g_line_color[line][k] = g_cgram_before[c];
+}
+
 IWRAM_CODE static void capture_line(int line) {
   for (int b = 0; b < 3; b++) {
     g_hofs[b][line] = g_hw.hofs[b];
     g_vofs[b][line] = g_hw.vofs[b];
   }
   g_fixed_line[line] = (uint16_t)(g_hw.fixed_r | g_hw.fixed_g << 5 | g_hw.fixed_b << 10);
+  g_line_tm[line] = g_hw.regs[0x2c];
+  g_line_ts[line] = g_hw.regs[0x2d];
+  g_line_cgwsel[line] = g_hw.regs[0x30];
+  g_line_cgadsub[line] = g_hw.regs[0x31];
+  for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_hw.cgram[g_hdma_color[k]];
+  g_hdma_line = line + 1;
 }
 
-static Pool *bg_pool(int b) { return (g_bg_setup[b] >> 31) ? &g_pool_b : &g_pool_a; }
+// The GBA palette entries showing SNES color c (render_frame's layout).
+static int gba_entries(int c, uint16_t *out) {
+  if (c >= 128) { out[0] = (uint16_t)(256 + c - 128); return 1; }
+  out[0] = (uint16_t)c;
+  if (c < 32) { out[1] = (uint16_t)((8 + c / 4) * 16 + c % 4); return 2; }
+  return 1;
+}
+
+static Pool *bg_pool(int b) { return &g_pools[b]; }
 
 static void clear_cells(int b) {
   volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
@@ -271,7 +368,7 @@ IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wi
     keys[cell] = key;
     if ((e & need_priority) != need_priority) {
       // A tile this layer doesn't show (see draw_bg).
-      dst_row[cell] = EMPTY_SLOT_B;
+      dst_row[cell] = (uint16_t)(EMPTY_SLOT - pool->index_base);
       continue;
     }
     uint32_t tile = ((chr + (e & 0x3ff) * words_per_tile) & 0x7fff) >> pool->shift;
@@ -280,7 +377,7 @@ IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wi
   }
 }
 
-__attribute__((noinline)) static void draw_bg(int b, int bpp, Frame *f) {
+__attribute__((noinline)) static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
   uint8_t sc = g_hw.regs[0x07 + b];
   uint32_t map_base = (uint32_t)(sc & 0xfc) << 8;     // words
   bool wide = sc & 1, tall = sc & 2;
@@ -289,13 +386,20 @@ __attribute__((noinline)) static void draw_bg(int b, int bpp, Frame *f) {
   // With BGMODE's bit 3 in Mode 1, BG3's priority tiles go in front of
   // everything and the rest behind everything (behind the opaque sky, in the
   // levels): BG3 is drawn in front, with its priority tiles only.
-  uint32_t need_priority = (b == 2 && (g_hw.regs[0x05] & 0x0f) == 0x09) ? 0x2000 : 0;
+  // (Only where BG3 is on the main screen: on the sub screen alone, it's
+  // behind the main screen's layers anyway, and its other tiles are seen.)
+  uint32_t need_priority = (b == 2 && (g_hw.regs[0x05] & 0x0f) == 0x09 && main_screen) ? 0x2000 : 0;
   uint32_t setup = (uint32_t)(bpp == 2) << 31 | (need_priority != 0) << 30 | sc << 16 | chr;
+  Pool *pool = bg_pool(b);
   if (setup != g_bg_setup[b]) {
     clear_cells(b);
     g_bg_setup[b] = setup;
+    uint8_t shift = bpp == 2 ? 3 : 4;
+    if (pool->shift != shift) {
+      flush_pool(pool);
+      pool->shift = shift;
+    }
   }
-  Pool *pool = bg_pool(b);
   volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
   uint32_t words_per_tile = bpp * 4;
   uint16_t pal_add = bpp == 2 ? 8 << 12 : 0;
@@ -370,7 +474,7 @@ IWRAM_CODE static void convert_obj_tile(uint32_t t, uint32_t base, uint32_t gap)
 // tiles there.
 IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap) {
   uint32_t *dirty = g_hw.vram_dirty;
-  uint32_t last_a = 0xffffffff, last_obj = 0xffffffff;   // 4bpp tiles span two chunks
+  uint32_t last_4bpp = 0xffffffff, last_obj = 0xffffffff;   // 4bpp tiles span two chunks
   for (uint32_t w = 0; w < 128; w++) {
     uint32_t bits = dirty[w];
     if (!bits) continue;
@@ -378,10 +482,12 @@ IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap) {
     for (uint32_t k = 0; bits; k++, bits >>= 1) {
       if (!(bits & 1)) continue;
       uint32_t chunk = w * 32 + k;                // 8 words
-      tile_changed(&g_pool_b, chunk);              // a 2bpp tile
-      if (chunk >> 1 != last_a) {
-        last_a = chunk >> 1;
-        tile_changed(&g_pool_a, chunk >> 1);       // a 4bpp tile
+      bool new_4bpp = chunk >> 1 != last_4bpp;
+      last_4bpp = chunk >> 1;
+      for (int i = 0; i < 3; i++) {
+        Pool *p = &g_pools[i];
+        if (p->shift == 3) tile_changed(p, chunk);                  // a 2bpp tile
+        else if (new_4bpp) tile_changed(p, chunk >> 1);             // a 4bpp tile
       }
       uint32_t word = chunk * 8;
       uint32_t t0 = (word - obj_base) & 0x7fff, t1 = (word - obj_base - obj_gap) & 0x7fff;
@@ -479,11 +585,11 @@ void render_init(void) {
   }
   // The fixed color's plane: a tile of color 15, everywhere, in palette 15
   // (BG3's 2bpp palettes use only colors 0-3 of 8-15).
-  volatile uint32_t *tile = (volatile uint32_t *)(BG_VRAM + POOL_B_BASE + PLANE_SLOT * 32);
+  volatile uint32_t *tile = (volatile uint32_t *)(BG_VRAM + PLANE_SLOT * 32);
   for (int r = 0; r < 8; r++) tile[r] = 0xffffffff;
-  volatile uint32_t *empty = (volatile uint32_t *)(BG_VRAM + POOL_B_BASE + EMPTY_SLOT_B * 32);
+  volatile uint32_t *empty = (volatile uint32_t *)(BG_VRAM + EMPTY_SLOT * 32);
   for (int r = 0; r < 8; r++) empty[r] = 0;
-  for (int i = 0; i < 1024; i++) SCREENBLOCK(PLANE_SCREENBLOCK)[i] = (uint16_t)(PLANE_SLOT | 15 << 12);
+  for (int i = 0; i < 1024; i++) SCREENBLOCK(PLANE_SCREENBLOCK)[i] = (uint16_t)((PLANE_SLOT - 1536) | 15 << 12);
   REG_DISPCNT = 0x0080;   // blank until the first frame
 }
 
@@ -507,48 +613,129 @@ void render_frame(void) {
     refresh_dirty(base, gap);
   }
 
-  // HDMA writes the registers line by line; note the scroll at each line.
+  // HDMA writes the registers line by line; note them at each line.
+  for (int i = 0; i < 256; i++) g_cgram_before[i] = g_hw.cgram[i];
+  g_num_hdma_colors = 0;
+  g_hdma_line = 0;
+  g_ppu_write_hook = hdma_write_hook;
   hw_hdma_frame(capture_line);
+  g_ppu_write_hook = 0;
 
-  uint8_t inidisp = g_hw.regs[0x00], mode = g_hw.regs[0x05] & 7, tm = g_hw.regs[0x2c];
-  uint8_t ts = g_hw.regs[0x2d], cgadsub = g_hw.regs[0x31];
+  uint8_t inidisp = g_hw.regs[0x00], mode = g_hw.regs[0x05] & 7;
   int bright = inidisp & 15;
-  uint16_t dispcnt = 0x1000;   // Mode 0, 2D sprites, OBJ on
-  if (mode == 1 || mode == 0) {
-    int bpp[3] = {4, 4, 2};
-    if (mode == 0) bpp[0] = bpp[1] = 2;
-    for (int b = 0; b < 3; b++) {
-      int sb = FIRST_SCREENBLOCK + b;
-      if (tm & (1 << b)) {
-        draw_bg(b, bpp[b], f);
-        dispcnt |= 0x100 << b;
-      }
-      uint32_t char_base = bpp[b] == 4 ? 0 : POOL_B_BASE / 0x4000;
-      f->bgcnt[b] = (uint16_t)((b + 1) | char_base << 2 | sb << 8);
+  bool modes01 = mode == 1 || mode == 0;
+
+  // The layers each shown line has on the main and sub screens, and its
+  // color math. The SNES adds (or subtracts) the sub screen's pixel, or the
+  // fixed color where the sub screen has none, to the main screen's, on the
+  // layers CGADSUB picks. The GBA blends a pixel of its first targets with
+  // the pixel under it, if that is a second target: the main screen's
+  // layers with math are first targets; the sub screen's layers, put behind
+  // the main screen's, are second targets, and so is a plane of the fixed
+  // color under everything (GBA BG3, its color set line by line by HBlank
+  // DMA), when the fixed color isn't black. Subtracting isn't done.
+  uint8_t main_any = 0, sub_any = 0;
+  bool plane = false;
+  for (int gy = 0; gy < LINES; gy++) {
+    int sy = g_src_line[gy];
+    uint8_t cgadsub = g_line_cgadsub[sy], cgwsel = g_line_cgwsel[sy];
+    bool math = modes01 && (cgadsub & 0x3f) && !(cgadsub & 0x80) && (cgwsel & 0x30) != 0x30;
+    main_any |= g_line_tm[sy];
+    if (math && (cgwsel & 2)) sub_any |= g_line_ts[sy] & ~g_line_tm[sy];
+    if (math && g_fixed_line[sy]) plane = true;
+  }
+  main_any &= 0x17;
+  sub_any &= 0x07;
+  uint16_t dispcnt_base = 0;   // Mode 0, 2D sprites
+  if (inidisp & 0x80) dispcnt_base |= 0x80;
+  if (plane) dispcnt_base |= 0x0800;
+  bool bg3_front = mode == 1 && (g_hw.regs[0x05] & 8);
+  int bpp[3] = {4, 4, 2};
+  if (mode == 0) bpp[0] = bpp[1] = 2;
+  uint16_t bgcnt_base[3];
+  for (int b = 0; b < 3; b++)
+  {
+    bgcnt_base[b] = (uint16_t)((uint32_t)b << 2 | (uint32_t)(FIRST_SCREENBLOCK + b) << 8);   // the pool's char base
+    f->bgcnt_base[b] = bgcnt_base[b];
+  }
+  f->per_line_regs = false;
+  for (int gy = 0; gy < LINES; gy++) {
+    int sy = g_src_line[gy];
+    uint8_t tm = g_line_tm[sy] & 0x17, cgadsub = g_line_cgadsub[sy], cgwsel = g_line_cgwsel[sy];
+    bool math = modes01 && (cgadsub & 0x3f) && !(cgadsub & 0x80) && (cgwsel & 0x30) != 0x30;
+    // The sub screen's layers: those only there are shown behind the main
+    // screen's; all are second targets (one on both is under the main
+    // screen's layers in front of it, as on the sub screen).
+    uint8_t sub_all = math && (cgwsel & 2) ? g_line_ts[sy] & 0x07 : 0;
+    uint8_t sub = sub_all & ~tm;
+    uint16_t layers = (uint16_t)((tm | sub) << 8);
+    uint16_t bldcnt = 0, bldalpha = 0;
+    if (math) {
+      bldcnt = (uint16_t)((cgadsub & 0x07 & tm) | (cgadsub & 0x20) | 0x40 | sub_all << 8 | 0x2000);
+      if (plane) bldcnt |= 0x0800;
+      bldalpha = (cgadsub & 0x40) ? 0x0808 : 0x1010;
     }
-    // Mode 1 with BG3's priority bit: BG3's priority tiles go in front of
-    // everything. All of BG3 does, for now.
-    if (mode == 1 && (g_hw.regs[0x05] & 8)) f->bgcnt[2] &= ~3;
+    // The layers' GBA priorities: the main screen's as always (BG3 with
+    // BGMODE's priority bit 0, else 3; BG1 1; BG2 2), the sub screen's
+    // behind them in the SNES's order (BG3 with the bit in front), each
+    // moved back where the GBA, which puts the lower-numbered BG in front
+    // of one of the same priority, would put it in front of one it should
+    // be behind.
+    int prio[3];
+    prio[0] = 1;
+    prio[1] = 2;
+    prio[2] = bg3_front ? 0 : 3;
+    int deepest = 0;
+    for (int b = 0; b < 3; b++)
+      if ((tm & (1 << b)) && prio[b] > deepest) deepest = prio[b];
+    static const uint8_t kOrder[2][3] = {{0, 1, 2}, {2, 0, 1}};   // front to back
+    uint8_t placed = tm & 7;
+    for (int i = 0; i < 3; i++) {
+      int b = kOrder[bg3_front][i];
+      if (!(sub & (1 << b))) continue;
+      int pr = deepest;
+      for (bool moved = true; moved && pr < 3;) {
+        moved = false;
+        for (int x = 0; x < 3; x++)
+          if ((placed & (1 << x)) && prio[x] == pr && b < x) { pr++; moved = true; break; }
+      }
+      prio[b] = pr;
+      deepest = pr;
+      placed |= (uint8_t)(1 << b);
+    }
+    uint16_t *r = f->line_regs[gy];
+    r[0] = dispcnt_base | layers;
+    r[1] = bldcnt;
+    r[2] = bldalpha;
+    r[3] = (uint16_t)(prio[0] | prio[1] << 2 | prio[2] << 4);
+    if (gy)
+      for (int k = 0; k < 4; k++)
+        if (r[k] != f->line_regs[0][k]) f->per_line_regs = true;
+  }
+  uint16_t dispcnt = f->line_regs[0][0];
+  f->bldcnt = f->line_regs[0][1];
+  f->bldalpha = f->line_regs[0][2];
+
+  if (modes01) {
+    for (int b = 0; b < 3; b++) {
+      if ((main_any | sub_any) & (1 << b)) draw_bg(b, bpp[b], (main_any >> b) & 1, f);
+      else g_visible_rows[b] = 0;   // its cells may go (evict_hidden)
+      f->bgcnt[b] = (uint16_t)(bgcnt_base[b] | ((f->line_regs[0][3] >> (2 * b)) & 3));
+    }
+  } else {
+    for (int b = 0; b < 3; b++) g_visible_rows[b] = 0;
+    dispcnt &= 0x1080;   // sprites only (Mode 7 isn't drawn yet)
+    f->per_line_regs = false;
   }
 
-  // Color math, for now one case: adding the fixed color to some
-  // backgrounds, with no background on the sub screen (where the sub
-  // screen is empty, the SNES adds the fixed color). The GBA adds a layer
-  // to the one under it: the fixed color is a plane under them (GBA BG3,
-  // priority 3), whose color HBlank DMA sets line by line.
-  f->bldcnt = 0;
   f->per_line_fixed = false;
-  f->bgcnt[3] = (uint16_t)(3 | (POOL_B_BASE / 0x4000) << 2 | PLANE_SCREENBLOCK << 8);
-  if ((mode == 1 || mode == 0) && (cgadsub & 0x07) && !(cgadsub & 0x80) && !(ts & 0x0f)) {
-    f->bldcnt = (uint16_t)((cgadsub & 0x07) | 0x40 | 0x0800);
-    f->bldalpha = (cgadsub & 0x40) ? 0x0808 : 0x1010;
-    dispcnt |= 0x0800;
+  f->bgcnt[3] = (uint16_t)(3 | 3 << 2 | PLANE_SCREENBLOCK << 8);
+  if (plane) {
     for (int gy = 0; gy < LINES; gy++) f->fixed[gy + 1] = scale_color(g_fixed_line[g_src_line[gy]], bright);
     f->fixed[0] = f->fixed[1];
     for (int gy = 1; gy < LINES; gy++)
       if (f->fixed[gy + 1] != f->fixed[1]) { f->per_line_fixed = true; break; }
   }
-  if (!(tm & 0x10)) dispcnt &= ~0x1000;
   draw_sprites(f);
   // The sprite matrices of a view that leaves lines out, 0-3 for no flip, X,
   // Y, both: a step of lines / 160 texels a line, and -1 for a flip.
@@ -573,7 +760,23 @@ void render_frame(void) {
   }
   f->palette[255] = f->fixed[0];
 
-  if (inidisp & 0x80) dispcnt |= 0x80;
+  // The colors HDMA rewrites: line 0's in the palette, the rest by line.
+  f->num_line_colors = (uint8_t)g_num_hdma_colors;
+  for (int k = 0; k < g_num_hdma_colors; k++) {
+    uint16_t idx[2] = {0, 0};
+    int n = gba_entries(g_hdma_color[k], idx);
+    f->pal_index[k][0] = idx[0];
+    f->pal_index[k][1] = n > 1 ? idx[1] : 0;
+    for (int gy = 0; gy < LINES; gy++) f->line_pal[gy][k] = scale_color(g_line_color[g_src_line[gy]][k], bright);
+    for (int j = 0; j < n; j++) f->palette[idx[j]] = f->line_pal[0][k];
+    if (!f->per_line_regs)
+      for (int gy = 1; gy < LINES; gy++)
+        if (f->line_pal[gy][k] != f->line_pal[0][k]) { f->per_line_regs = true; break; }
+  }
+  // The palette is remade when CGRAM changes; these entries were changed
+  // in it for this frame only.
+  if (f->num_line_colors) f->palette_key = NO_KEY;
+
   f->dispcnt = dispcnt;
 
   // Line 0's scroll is set at VBlank; HBlank DMA sets each next line's.
@@ -583,6 +786,14 @@ void render_frame(void) {
     for (int k = 0; k < 6; k++)
       if (f->scroll[gy + 1][k] != f->scroll[1][k]) { f->per_line_scroll = true; break; }
 
+#ifdef RENDER_DEBUG
+  static uint32_t full[3];
+  if (g_pools[0].full != full[0] || g_pools[1].full != full[1] || g_pools[2].full != full[2]) {
+    debug_printf("tile slots ran out: %u (BG1), %u (BG2), %u (BG3)", g_pools[0].full - full[0],
+                 g_pools[1].full - full[1], g_pools[2].full - full[2]);
+    for (int i = 0; i < 3; i++) full[i] = g_pools[i].full;
+  }
+#endif
   g_pending = fi;
   g_render_cycles += cycles_now() - t1;
 }
@@ -635,10 +846,54 @@ void render_vblank(void) {
     REG_DMA0CNT = 8 | 0x80000000u | 0x20000000u | 0x02000000u | 0x00600000u;
   }
   BG_PALETTE[255] = f->fixed[0];
+  if (f->per_line_regs) {
+    // Line 0's, which the last frame's HBlank interrupts changed.
+    REG_DISPCNT = f->line_regs[0][0];
+    REG16(0x04000050) = f->line_regs[0][1];
+    REG16(0x04000052) = f->line_regs[0][2];
+    for (int b = 0; b < 3; b++)
+      REG16(0x04000008 + b * 2) = f->bgcnt_base[b] | ((f->line_regs[0][3] >> (2 * b)) & 3);
+    for (uint32_t k = 0; k < f->num_line_colors; k++) {
+      BG_PALETTE[f->pal_index[k][0]] = f->line_pal[0][k];
+      if (f->pal_index[k][1]) BG_PALETTE[f->pal_index[k][1]] = f->line_pal[0][k];
+    }
+  }
+  // The HBlank interrupt (render_hblank), for frames whose layers, color
+  // math or colors change down the screen.
+  if (f->per_line_regs) {
+    REG_DISPSTAT |= 1 << 4;
+    REG_IE |= 2;
+  } else {
+    REG_DISPSTAT &= ~(1 << 4);
+    REG_IE &= ~2;
+  }
   if (f->per_line_fixed) {
     // After each line, the next line's fixed color, into palette entry 255.
     REG_DMA1SAD = (uint32_t)&f->fixed[2];
     REG_DMA1DAD = 0x050001fe;
     REG_DMA1CNT = 1 | 0x80000000u | 0x20000000u | 0x02000000u | 0x00400000u;
+  }
+}
+
+// In each line's HBlank, while the frame on screen needs it: the next
+// line's layers, color math and rewritten colors.
+IWRAM_CODE void render_hblank(void) {
+  uint32_t v = REG_VCOUNT + 1;
+  if (v >= LINES) return;
+  const Frame *f = &g_frames[g_shown];
+  if (!f->per_line_regs) return;
+  const uint16_t *r = f->line_regs[v];
+  REG_DISPCNT = r[0];
+  REG16(0x04000050) = r[1];
+  REG16(0x04000052) = r[2];
+  uint32_t pr = r[3];
+  REG16(0x04000008) = f->bgcnt_base[0] | (pr & 3);
+  REG16(0x0400000a) = f->bgcnt_base[1] | ((pr >> 2) & 3);
+  REG16(0x0400000c) = f->bgcnt_base[2] | ((pr >> 4) & 3);
+  volatile uint16_t *pal = BG_PALETTE;
+  for (uint32_t k = 0; k < f->num_line_colors; k++) {
+    uint16_t c = f->line_pal[v][k];
+    pal[f->pal_index[k][0]] = c;
+    if (f->pal_index[k][1]) pal[f->pal_index[k][1]] = c;
   }
 }

@@ -19,5 +19,6 @@ void render_hold(int frames);
 extern uint32_t g_render_cycles, g_idle_cycles;
 // From the VBlank interrupt.
 void render_vblank(void);
+void render_hblank(void);
 
 #endif

@@ -23,6 +23,7 @@ volatile uint8_t g_lag_event, g_frame_vblanks;
 
 void irq_handler(void) {
   uint16_t flags = REG_IF;
+  if (flags & 2) render_hblank();
   if (flags & 1) {
     render_vblank();
     if (++g_frame_vblanks > LAG_VBLANKS) g_lag_event = 1;
