@@ -21,12 +21,18 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// Hot code: on the GBA, ARM in IWRAM (gba/platform_cpu.h sets HOT_CODE).
+#ifndef HOT_CODE
+#define HOT_CODE
+#endif
+
 typedef struct {
   uint16_t vram[0x8000];
-  // A counter per 16 bytes of VRAM, bumped on every write there: a renderer
-  // that converts tiles keeps the counts it converted at to see changes.
-  uint8_t vram_ver[0x1000];
+  // A bit per 16 bytes of VRAM, set by every write there, for a renderer
+  // that converts tiles to see which changed (it clears them).
+  uint32_t vram_dirty[0x1000 / 32];
   uint16_t cgram[256];
+  uint16_t cgram_ver;        // bumped on every CGRAM write, for renderers
   uint16_t oam[256];
   uint8_t high_oam[32];
   uint8_t regs[0x40];        // the last value written to each $21xx PPU register
@@ -76,6 +82,9 @@ void hw_reset(void);
 // game's and HDMA's, goes to g_ppu_write_hook too when it's set.
 void hw_hdma_begin(void);
 void hw_hdma_line(void);
+// The same for a whole frame: begin, then the 224 lines, calling
+// after_line(line) after each line's transfers (NULL: none).
+void hw_hdma_frame(void (*after_line)(int line));
 extern void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
 // The start of VBlank: the NMI flag, and the joypads read (auto-joypad).
 void hw_vblank(uint16_t joy1);

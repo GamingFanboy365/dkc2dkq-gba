@@ -76,6 +76,8 @@ static void ref_load_state(void) {
   ppu->scrollPrev2 = g_hw.scroll_prev2;
 }
 
+static void draw_line(int line) { ppu_runLine(g_ref->ppu, line + 1); }
+
 // Runs the frame's HDMA on the model, and draws the frame if asked.
 static void run_display(bool draw) {
   if (draw) {
@@ -91,11 +93,7 @@ static void run_display(bool draw) {
   // where the rewrite came partway down the SNES's screen, some lines differ
   // by the scroll's change of a frame (a pixel). Matching it would take the
   // logic's timing to the scanline.
-  hw_hdma_begin();
-  for (int line = 0; line < 224; line++) {
-    hw_hdma_line();
-    if (draw) ppu_runLine(g_ref->ppu, line + 1);
-  }
+  hw_hdma_frame(draw ? draw_line : NULL);
   g_ppu_write_hook = NULL;
   if (draw) {
     static uint8_t pixels[512 * 480 * 4];

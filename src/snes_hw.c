@@ -1,10 +1,10 @@
 // See snes_hw.h. The ports behave as LakeSnes's (third_party/lakesnes/ppu.c,
 // snes.c, dma.c, cart.c), which is what the game is checked against.
+#include "cpu65.h"   // first: the platform's HOT_CODE
 #include "snes_hw.h"
 
 #include <string.h>
 
-#include "cpu65.h"
 #include "snes_mem.h"
 
 #ifndef EWRAM_DATA
@@ -77,7 +77,7 @@ static uint16_t vram_remap(void) {
 
 void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
 
-static void ppu_write(uint8_t adr, uint8_t val) {
+HOT_CODE static void ppu_write(uint8_t adr, uint8_t val) {
   g_hw.regs[adr] = val;
   if (g_ppu_write_hook) g_ppu_write_hook(adr, val);
   switch (adr) {
@@ -144,14 +144,14 @@ static void ppu_write(uint8_t adr, uint8_t val) {
     case 0x18: {
       uint16_t a = vram_remap() & 0x7fff;
       g_hw.vram[a] = (g_hw.vram[a] & 0xff00) | val;
-      g_hw.vram_ver[a >> 3]++;
+      g_hw.vram_dirty[a >> 8] |= 1u << ((a >> 3) & 31);
       if (!g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }
     case 0x19: {
       uint16_t a = vram_remap() & 0x7fff;
       g_hw.vram[a] = (uint16_t)((g_hw.vram[a] & 0x00ff) | val << 8);
-      g_hw.vram_ver[a >> 3]++;
+      g_hw.vram_dirty[a >> 8] |= 1u << ((a >> 3) & 31);
       if (g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }
@@ -171,6 +171,7 @@ static void ppu_write(uint8_t adr, uint8_t val) {
       if (!g_hw.cgram_second_write) g_hw.cgram_buffer = val;
       else g_hw.cgram[g_hw.cgram_pointer++] = (uint16_t)(val << 8 | g_hw.cgram_buffer);
       g_hw.cgram_second_write ^= 1;
+      g_hw.cgram_ver++;
       break;
     default:
       break;
@@ -265,7 +266,7 @@ static void apu_update(void) {
 
 // ---- the B bus: PPU, APU ports, WRAM port ----
 
-static void bbus_write(uint8_t adr, uint8_t val) {
+HOT_CODE static void bbus_write(uint8_t adr, uint8_t val) {
   if (adr < 0x40) {
     ppu_write(adr, val);
   } else if (adr < 0x80) {
@@ -322,25 +323,29 @@ static const uint8_t *direct_source(uint32_t addr, uint32_t len) {
 // The common big transfer: words to VRAM ($2118/$2119, mode 1), the
 // address stepping after the high byte, no remapping. As the byte-by-byte
 // path would do it, write for write.
-static bool fast_vram_dma(const uint8_t *src, bool fixed, uint32_t size) {
+HOT_CODE static bool fast_vram_dma(const uint8_t *src, bool fixed, uint32_t size) {
   if (!g_hw.vram_increment_on_high || g_hw.vram_remap || (size & 1)) return false;
   uint16_t ptr = g_hw.vram_pointer, inc = g_hw.vram_increment;
   uint16_t *vram = g_hw.vram;
-  uint8_t *ver = g_hw.vram_ver;
+  uint32_t *dirty = g_hw.vram_dirty;
   if (fixed) {
     // A fixed source writes its first byte to both halves.
     uint16_t w = (uint16_t)(src[0] | src[0] << 8);
     for (uint32_t n = size >> 1; n; n--) {
       uint16_t a = ptr & 0x7fff;
       vram[a] = w;
-      ver[a >> 3] += 2;
+      dirty[a >> 8] |= 1u << ((a >> 3) & 31);
       ptr += inc;
     }
   } else {
+    uint32_t last_chunk = 0xffffffff;
     for (uint32_t n = size >> 1; n; n--, src += 2) {
-      uint16_t a = ptr & 0x7fff;
+      uint32_t a = ptr & 0x7fff;
       vram[a] = (uint16_t)(src[0] | src[1] << 8);
-      ver[a >> 3] += 2;
+      if (a >> 3 != last_chunk) {
+        last_chunk = a >> 3;
+        dirty[a >> 8] |= 1u << ((a >> 3) & 31);
+      }
       ptr += inc;
     }
   }
@@ -352,7 +357,7 @@ static bool fast_vram_dma(const uint8_t *src, bool fixed, uint32_t size) {
 
 // OAM ($2104) and CGRAM ($2122) uploads, mode 0: the ports' own steps
 // (ppu_write), without the per-byte dispatch.
-static void fast_oam_dma(const uint8_t *src, uint32_t size) {
+HOT_CODE static void fast_oam_dma(const uint8_t *src, uint32_t size) {
   for (; size; size--) {
     uint8_t val = *src++;
     if (g_hw.oam_in_high) {
@@ -372,13 +377,14 @@ static void fast_oam_dma(const uint8_t *src, uint32_t size) {
   }
 }
 
-static void fast_cgram_dma(const uint8_t *src, uint32_t size) {
+HOT_CODE static void fast_cgram_dma(const uint8_t *src, uint32_t size) {
   for (; size; size--) {
     uint8_t val = *src++;
     if (!g_hw.cgram_second_write) g_hw.cgram_buffer = val;
     else g_hw.cgram[g_hw.cgram_pointer++] = (uint16_t)(val << 8 | g_hw.cgram_buffer);
     g_hw.cgram_second_write ^= 1;
     g_hw.regs[0x22] = val;
+    g_hw.cgram_ver++;
   }
 }
 
@@ -447,7 +453,15 @@ void hw_hdma_begin(void) {
   }
 }
 
-void hw_hdma_line(void) {
+HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
+  hw_hdma_begin();
+  for (int line = 0; line < 224; line++) {
+    hw_hdma_line();
+    if (after_line) after_line(line);
+  }
+}
+
+HOT_CODE void hw_hdma_line(void) {
   for (int c = 0; c < 8; c++) {
     if (!g_hw.hdma[c].active) continue;
     const uint8_t *r = g_hw.dma[c];
@@ -539,7 +553,7 @@ static uint8_t cpu_reg_read(uint16_t adr) {
 // ---- the memory map (HiROM) ----
 // The common cases are inline in snes_mem.h; these do all of them.
 
-uint8_t rd8_slow(uint32_t a) {
+HOT_CODE uint8_t rd8_slow(uint32_t a) {
   uint8_t bank = a >> 16;
   uint16_t lo = (uint16_t)a;
   uint8_t v;
@@ -559,7 +573,7 @@ uint8_t rd8_slow(uint32_t a) {
   return g_rom[(((uint32_t)(bank & 0x3f) << 16) | lo) & g_rom_mask];
 }
 
-void wr8_slow(uint32_t a, uint8_t v) {
+HOT_CODE void wr8_slow(uint32_t a, uint8_t v) {
   uint8_t bank = a >> 16;
   uint16_t lo = (uint16_t)a;
   if ((bank & 0xfe) == 0x7e) { g_wram[a & 0x1ffff] = v; return; }

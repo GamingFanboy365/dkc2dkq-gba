@@ -26,9 +26,13 @@
  *               .vram (96 KiB), .pal (1 KiB) and .oam (1 KiB)  [MEMDUMP=1]
  *   -q          quiet (no per-shot log lines)
  *
+ * STATE_AT_SHOT=N with -w FILE writes the savestate when shot N is taken (a
+ * game frame the cartridge names, rather than a GBA frame).
+ *
  * PROFILE=FILE samples the program counter a few hundred times a frame (after
  * each of the core's steps to its next hardware event) and writes "PC COUNT"
- * lines; tools/profile_report.py sums them by function.
+ * lines; tools/profile_report.py sums them by function. PROFILE_FROM=N
+ * starts sampling at frame N.
  *
  * What the game prints through mGBA's debug registers (0x04FFF600) goes to
  * stdout, a line per message. With SHOT_ON=1 (or -t), a message "shot N"
@@ -292,6 +296,7 @@ static void writeState(struct mCore* core, const char* path) {
 static uint32_t* profilePcs;
 static uint32_t* profileCounts;
 static size_t profileCap = 1 << 20;
+static unsigned profileFrom;   /* PROFILE_FROM=N: start sampling at frame N */
 
 static void profileSample(uint32_t pc) {
 	size_t h = (pc * 2654435761u) & (profileCap - 1);
@@ -392,6 +397,9 @@ int main(int argc, char** argv) {
 	saveArg = opt(saveArg, "SAVE");
 	if (getenv("PROFILE") && *getenv("PROFILE")) {
 		profilePcs = calloc(profileCap, sizeof(uint32_t));
+		if (getenv("PROFILE_FROM")) {
+			profileFrom = (unsigned) atoi(getenv("PROFILE_FROM"));
+		}
 		profileCounts = calloc(profileCap, sizeof(uint32_t));
 	}
 	if (getenv("SHOT_ON") && strcmp(getenv("SHOT_ON"), "1") == 0) {
@@ -483,7 +491,7 @@ int main(int argc, char** argv) {
 			--segLeft;
 		}
 		core->setKeys(core, keys);
-		if (profilePcs) {
+		if (profilePcs && f >= profileFrom) {
 			runFrameProfiled(core);
 		} else {
 			core->runFrame(core);
@@ -492,6 +500,9 @@ int main(int argc, char** argv) {
 			shoot(core, outDir, prefix, (unsigned) printedShot, quiet);
 			if (memDump) {
 				dumpMemory(core, outDir, prefix, (unsigned) printedShot);
+			}
+			if (stateOutArg && getenv("STATE_AT_SHOT") && atoi(getenv("STATE_AT_SHOT")) == printedShot) {
+				writeState(core, stateOutArg);
 			}
 		}
 		if (wantShot(shots, nShots, f)) {

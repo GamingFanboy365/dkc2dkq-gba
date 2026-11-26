@@ -11,6 +11,9 @@
 
 #include "snes_mem.h"
 
+// Hot code goes to IWRAM as ARM.
+#define HOT_CODE __attribute__((section(".iwram"), target("arm"), noinline))
+
 extern volatile uint8_t g_lag_event;
 #define CYC(n) ((void)0)
 #define EVENT_PENDING() (g_lag_event)
