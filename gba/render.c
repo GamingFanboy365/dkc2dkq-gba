@@ -26,7 +26,8 @@
 //   additively, its color set line by line by HBlank DMA.
 // - The SNES's 256x224 screen on the 240x160 one (render_set_view): all
 //   224 lines, a GBA line showing every 1.4th SNES line (its scroll set by
-//   HBlank DMA, as for HDMA), the sprites shrunk to match as affine sprites;
+//   HBlank DMA, as for HDMA), the sprites' pictures made of the same SNES
+//   lines each frame (draw_sprites_squeezed);
 //   or 160 of its lines at full size, from a line main.c picks (in the
 //   levels, around the Kong). Columns 8-247 either way.
 // Not yet: other color math, windows, per-tile priority, Mode 7.
@@ -46,8 +47,8 @@
 // top + y * lines / 160 (with more than 160, some lines are left out), the
 // sprites shrunk to match by affine sprites.
 static int g_view_top = -1, g_view_lines;
-static int32_t g_view_scale;   // 160 / lines, 16.16
 static uint8_t g_src_line[LINES];
+static uint8_t g_first_gba_line[225];   // per SNES line: the first GBA line showing it or one below
 
 // a / b (there's no division in this build's C library); rarely called.
 static uint32_t udiv(uint32_t a, uint32_t b) {
@@ -67,8 +68,11 @@ void render_set_view(int top, int lines) {
   if (top == g_view_top && lines == g_view_lines) return;
   g_view_top = top;
   g_view_lines = lines;
-  g_view_scale = (int32_t)udiv(LINES << 16, lines);
   for (int y = 0; y < LINES; y++) g_src_line[y] = (uint8_t)(top + udiv(y * lines, LINES));
+  for (int sy = 0, g = 0; sy <= 224; sy++) {
+    while (g < LINES && g_src_line[g] < sy) g++;
+    g_first_gba_line[sy] = (uint8_t)g;
+  }
 }
 
 #define BG_VRAM ((volatile uint8_t *)0x06000000)
@@ -471,7 +475,7 @@ IWRAM_CODE static void convert_obj_tile(uint32_t t, uint32_t base, uint32_t gap)
 // What VRAM writes changed since the last frame (snes_hw's dirty bits, a
 // bit per 16 bytes): the background tiles cached from there, the sprite
 // tiles there.
-IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap) {
+IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap, bool obj_tiles) {
   uint32_t *dirty = g_hw.vram_dirty;
   uint32_t last_4bpp = 0xffffffff, last_obj = 0xffffffff;   // 4bpp tiles span two chunks
   for (uint32_t w = 0; w < 128; w++) {
@@ -488,6 +492,7 @@ IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap) {
         if (p->shift == 3) tile_changed(p, chunk);                  // a 2bpp tile
         else if (new_4bpp) tile_changed(p, chunk >> 1);             // a 4bpp tile
       }
+      if (!obj_tiles) continue;
       uint32_t word = chunk * 8;
       uint32_t t0 = (word - obj_base) & 0x7fff, t1 = (word - obj_base - obj_gap) & 0x7fff;
       uint32_t t = t0 < 0x1000 ? t0 >> 4 : t1 < 0x1000 ? 256 + (t1 >> 4) : 0xffffffff;
@@ -513,17 +518,112 @@ static const uint8_t kObjSizes[8][2] = {
   {8, 16}, {8, 32}, {8, 64}, {16, 32}, {16, 64}, {32, 64}, {16, 32}, {16, 32},
 };
 
+// The sprites of a view that leaves lines out: each frame, a picture of
+// each sprite made of the SNES lines the GBA shows (the backgrounds' lines,
+// so a sprite of several pieces has no seams), in half of OBJ VRAM (1D
+// mapping): tiles 0-511 for one of the two frames, 512-1023 for the other.
+// Sprites with the same tiles, size, flip and line get one picture.
+#define OBJ_HALF_TILES 512
+
+typedef struct {
+  uint32_t key;
+  uint16_t tile;
+} ObjPicture;
+
+IWRAM_CODE static void make_obj_picture(volatile uint32_t *dst, uint32_t t, int size, int tiles_w, int tiles_h,
+                                        int y, int g0, int n, bool vflip, uint32_t base, uint32_t gap) {
+  const uint16_t *vram = g_hw.vram;
+  const uint32_t *ex = g_expand;
+  for (int k = 0; k < tiles_h * 8; k++) {
+    volatile uint32_t *row = dst + (k >> 3) * tiles_w * 8 + (k & 7);
+    if (k >= n) {
+      for (int tx = 0; tx < tiles_w; tx++) row[tx * 8] = 0;
+      continue;
+    }
+    int r = g_src_line[g0 + k] - y;
+    if (vflip) r = size - 1 - r;
+    uint32_t trow = (((t >> 4) + (uint32_t)(r >> 3)) & 15) << 4, line = (uint32_t)r & 7;
+    uint32_t table = t & 0x100 ? base + gap : base;
+    for (int tx = 0; tx < tiles_w; tx++) {
+      uint32_t idx = trow | ((t + (uint32_t)tx) & 15);
+      uint32_t w = (table + idx * 16 + line) & 0x7fff;
+      uint32_t a = vram[w], b2 = vram[(w + 8) & 0x7fff];
+      row[tx * 8] = ex[a & 0xff] | ex[a >> 8] << 1 | ex[b2 & 0xff] << 2 | ex[b2 >> 8] << 3;
+    }
+  }
+}
+
+IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, uint32_t gap, uint8_t obsel) {
+  static ObjPicture made[128];
+  int num_made = 0;
+  uint32_t next = 0;
+  int top = g_view_top, bottom = g_view_top + g_view_lines;
+  for (int i = 0; i < 128; i++) {
+    uint16_t w0 = g_hw.oam[i * 2], w1 = g_hw.oam[i * 2 + 1];
+    uint8_t high = (g_hw.high_oam[i >> 2] >> ((i & 3) * 2)) & 3;
+    int size = kObjSizes[obsel >> 5][(high >> 1) & 1];
+    int x = (w0 & 0xff) | (high & 1) << 8;
+    if (x >= 256) x -= 512;
+    int y = w0 >> 8;
+    if (y >= 224) y -= 256;   // the SNES wraps at the bottom of its 256 lines
+    int gx = x - CROP_X;
+    uint16_t *o = &f->oam[i * 4];
+    int y0 = y < top ? top : y, y1 = y + size > bottom ? bottom : y + size;
+    int g0 = y0 < 225 ? g_first_gba_line[y0] : LINES, g1 = y1 < 225 ? g_first_gba_line[y1] : LINES;
+    int n = g1 - g0;
+    if (gx <= -size || gx >= 240 || y1 <= y0 || n <= 0) {
+      o[0] = 0x0200;   // hidden
+      o[1] = o[2] = 0;
+      continue;
+    }
+    uint8_t attr = w1 >> 8;
+    uint32_t t = (w1 & 0xff) | (w1 & 0x100);
+    bool vflip = attr & 0x80;
+    // The GBA shape: as wide, as tall as needed (square, or half as tall).
+    int tiles_w = size >> 3, tiles_h = n <= size / 2 && size > 8 ? size >> 4 : size >> 3;
+    int shape = tiles_h < tiles_w ? 1 : 0;
+    int gsize = size == 8 ? 0 : size == 16 ? 1 : size == 32 ? 2 : 3;
+    if (shape) gsize = size == 16 ? 0 : size == 32 ? 2 : 3;   // 16x8, 32x16, 64x32
+    // The picture's lines depend on Y (and the view).
+    uint32_t key = t | (uint32_t)vflip << 9 | (uint32_t)(size >> 3) << 10 | (uint32_t)(y & 0x1ff) << 14;
+    uint32_t tile = 0xffff;
+    for (int m = 0; m < num_made; m++)
+      if (made[m].key == key) { tile = made[m].tile; break; }
+    if (tile == 0xffff) {
+      uint32_t count = (uint32_t)(tiles_w * tiles_h);
+      if (next + count > OBJ_HALF_TILES) {
+        o[0] = 0x0200;   // out of room
+        o[1] = o[2] = 0;
+        continue;
+      }
+      tile = (uint32_t)half * OBJ_HALF_TILES + next;
+      next += count;
+      make_obj_picture(OBJ_VRAM + tile * 8, t, size, tiles_w, tiles_h, y, g0, n, vflip, base, gap);
+      made[num_made].key = key;
+      made[num_made].tile = (uint16_t)tile;
+      num_made++;
+    }
+    o[0] = (uint16_t)((g0 & 0xff) | shape << 14);
+    o[1] = (uint16_t)((gx & 0x1ff) | (attr & 0x40) << 6 | gsize << 14);
+    o[2] = (uint16_t)(tile | kObjPriority[(attr >> 4) & 3] << 10 | ((attr >> 1) & 7) << 12);
+  }
+}
+
 __attribute__((noinline)) static void draw_sprites(Frame *f) {
   uint8_t obsel = g_hw.regs[0x01];
   uint32_t base = (uint32_t)(obsel & 7) << 13;
   uint32_t gap = (uint32_t)(((obsel >> 3) & 3) + 1) << 12;
+  if (g_view_lines != LINES) {
+    draw_sprites_squeezed(f, (int)(f - g_frames), base, gap, obsel);
+    g_obj_base_seen = 0xffffffff;   // OBJ VRAM holds other things now
+    return;
+  }
   if (base != g_obj_base_seen || gap != g_obj_gap_seen) {
     for (uint32_t t = 0; t < 512; t++) convert_obj_tile(t, base, gap);
     g_obj_base_seen = base;
     g_obj_gap_seen = gap;
   }
   int top = g_view_top;
-  bool fit = g_view_lines != LINES;
   for (int i = 0; i < 128; i++) {
     uint16_t w0 = g_hw.oam[i * 2], w1 = g_hw.oam[i * 2 + 1];
     uint8_t high = (g_hw.high_oam[i >> 2] >> ((i & 3) * 2)) & 3;
@@ -535,13 +635,6 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
     int gx = x - CROP_X;
     uint16_t *o = &f->oam[i * 4];
     // Off the window (with SNES's wrap at the bottom of the 256 lines).
-    if (fit) {
-      // An affine sprite draws its picture shrunk around the middle of its
-      // box: the box goes where that puts SNES line Y at GBA line
-      // (Y - top) * 160 / lines.
-      if (y >= 224) y -= 256;
-      sy = ((((2 * (y - top) + size) * g_view_scale) >> 16) - size) >> 1;
-    }
     if (sy >= LINES) sy -= 256;
     if (gx <= -size || gx >= 240 || sy <= -size || sy >= LINES) {
       o[0] = 0x0200;   // hidden
@@ -552,14 +645,8 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
     uint32_t gtile = (t >> 4) * 32 + (t & 15);
     int gsize = size == 8 ? 0 : size == 16 ? 1 : size == 32 ? 2 : 3;
     uint8_t attr = w1 >> 8;
-    if (fit) {
-      // Affine, with matrix 0-3 by the flips (see render_frame).
-      o[0] = (uint16_t)((sy & 0xff) | 0x100);
-      o[1] = (uint16_t)((gx & 0x1ff) | ((attr >> 6) & 3) << 9 | gsize << 14);
-    } else {
-      o[0] = (uint16_t)(sy & 0xff);
-      o[1] = (uint16_t)((gx & 0x1ff) | (attr & 0x40) << 6 | (attr & 0x80) << 6 | gsize << 14);
-    }
+    o[0] = (uint16_t)(sy & 0xff);
+    o[1] = (uint16_t)((gx & 0x1ff) | (attr & 0x40) << 6 | (attr & 0x80) << 6 | gsize << 14);
     o[2] = (uint16_t)(gtile | kObjPriority[(attr >> 4) & 3] << 10 | ((attr >> 1) & 7) << 12);
   }
 }
@@ -609,7 +696,7 @@ IWRAM_CODE void render_frame(void) {
     uint8_t obsel = g_hw.regs[0x01];
     uint32_t base = (uint32_t)(obsel & 7) << 13;
     uint32_t gap = (uint32_t)(((obsel >> 3) & 3) + 1) << 12;
-    refresh_dirty(base, gap);
+    refresh_dirty(base, gap, g_view_lines == LINES);
   }
 
   // HDMA writes the registers line by line; note them at each line.
@@ -644,7 +731,7 @@ IWRAM_CODE void render_frame(void) {
   }
   main_any &= 0x17;
   sub_any &= 0x07;
-  uint16_t dispcnt_base = 0;   // Mode 0, 2D sprites
+  uint16_t dispcnt_base = g_view_lines == LINES ? 0 : 0x40;   // Mode 0, 2D sprites (1D: draw_sprites_squeezed)
   if (inidisp & 0x80) dispcnt_base |= 0x80;
   if (plane) dispcnt_base |= 0x0800;
   bool bg3_front = mode == 1 && (g_hw.regs[0x05] & 8);
@@ -732,7 +819,7 @@ IWRAM_CODE void render_frame(void) {
     }
   } else {
     for (int b = 0; b < 3; b++) g_visible_rows[b] = 0;
-    dispcnt &= 0x1080;   // sprites only (Mode 7 isn't drawn yet)
+    dispcnt &= 0x10c0;   // sprites only (Mode 7 isn't drawn yet)
     f->per_line_regs = false;
   }
 
@@ -745,15 +832,6 @@ IWRAM_CODE void render_frame(void) {
       if (f->fixed[gy + 1] != f->fixed[1]) { f->per_line_fixed = true; break; }
   }
   draw_sprites(f);
-  // The sprite matrices of a view that leaves lines out, 0-3 for no flip, X,
-  // Y, both: a step of lines / 160 texels a line, and -1 for a flip.
-  int pd = (int)udiv(g_view_lines << 8, LINES);
-  for (int m = 0; m < 4; m++) {
-    f->oam[m * 16 + 3] = (uint16_t)((m & 1) ? -256 : 256);   // pa
-    f->oam[m * 16 + 7] = 0;                                  // pb
-    f->oam[m * 16 + 11] = 0;                                 // pc
-    f->oam[m * 16 + 15] = (uint16_t)((m & 2) ? -pd : pd);    // pd
-  }
 
   // Palettes: SNES BG colors 0-127, BG3's 2bpp palettes as 16-color ones,
   // and the sprite colors, with the screen's brightness applied. Rebuilt
