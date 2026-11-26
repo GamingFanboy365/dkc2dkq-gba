@@ -74,6 +74,11 @@ class Insn:
         return (self.addr & 0xFF0000) | ((self.addr + self.length) & 0xFFFF)
 
 
+# Per traced instruction, the one value of DB (D) the trace saw there, or
+# None if it saw more (ea_expr then emits DBK/DPK: see src/cpu65.h).
+TRACE_DB, TRACE_DP = {}, {}
+
+
 def load_traces(paths):
     flags, edges = collections.defaultdict(int), set()
     for path in paths:
@@ -82,7 +87,13 @@ def load_traces(paths):
             if p[0] == "E":
                 edges.add((canonical(int(p[1], 16)), canonical(int(p[2], 16))))
             else:
-                flags[canonical(int(p[0], 16))] |= int(p[1], 16)
+                a = canonical(int(p[0], 16))
+                flags[a] |= int(p[1], 16)
+                for k, d in ((2, TRACE_DB), (3, TRACE_DP)):
+                    if len(p) <= k:
+                        continue
+                    v = None if p[k].endswith("*") else int(p[k], 16)
+                    d[a] = v if d.get(a, v) == v else None
     return flags, edges
 
 
@@ -300,7 +311,10 @@ def infer_widths(insns, tflags, dyn):
             insns[a].assumed = True
 
 
-MAX_FUNCTION = 1500
+# At most this many instructions in a function: bigger ones (a bank's
+# routines merged by their jumps, with hundreds of entries) spill so much
+# that one frame took 2.6 KB of the GBA's 3.8 KB stack.
+MAX_FUNCTION = 1000
 
 
 def make_regions(insns):
@@ -363,7 +377,36 @@ def hx(v, n=4):
     return f"0x{v:0{n}x}"
 
 
+# Addressing modes whose address is a constant when D (DB) is: the
+# instruction is emitted twice, for the value the trace saw and for any other.
+DP_CONST_MODES = {"dp", "dpi", "dpiy", "dpil", "dpily"}
+DB_CONST_MODES = {"abs", "dpi", "dpiy"}
+
+
+def const_cases(i):
+    """{'D': k, 'DB': k} for the registers the instruction's address can be
+    made constant by, from the trace; empty if none."""
+    out = {}
+    if i.mode in DP_CONST_MODES and TRACE_DP.get(i.addr) is not None:
+        out["D"] = TRACE_DP[i.addr]
+    if i.mode in DB_CONST_MODES and TRACE_DB.get(i.addr) is not None:
+        out["DB"] = TRACE_DB[i.addr]
+    return out
+
+
+CONSTS = {}   # while emitting the constant case: {'D': k, 'DB': k}
+
+
 def ea_expr(i):
+    e = ea_expr_generic(i)
+    if "D" in CONSTS:
+        e = e.replace("DP(", f"KDP({hx(CONSTS['D'])}, ")
+    if "DB" in CONSTS:
+        e = e.replace("DBA(", f"KDB({hx(CONSTS['DB'], 2)}, ")
+    return e
+
+
+def ea_expr_generic(i):
     o, m = i.operand, i.mode
     if m == "dp": return f"DP({hx(o, 2)})"
     if m == "dpx": return f"DP({hx(o, 2)} + X)"
@@ -460,9 +503,9 @@ def emit_op(i, w):
     if mn == "TXS":
         return ["cpu.s = cpu.e ? (0x100 | (X & 0xff)) : X;"]
     if mn == "TCD":
-        return ["cpu.d = A; NZ16(A);"]
+        return ["D = A; NZ16(A);"]
     if mn == "TDC":
-        return ["A = cpu.d; NZ16(A);"]
+        return ["A = D; NZ16(A);"]
     if mn == "TCS":
         return ["cpu.s = cpu.e ? (0x100 | (A & 0xff)) : A;"]
     if mn == "TSC":
@@ -475,10 +518,10 @@ def emit_op(i, w):
         return [f"{{ {u} t = pull{w}(); {set_a('t')} {nz}(t); }}"]
     if mn in ("PLX", "PLY"):
         return [f"{mn[2]} = pull{w}(); {nz}({mn[2]});"]
-    if mn == "PHB": return ["push8(cpu.db);"]
-    if mn == "PLB": return ["cpu.db = pull8(); NZ8(cpu.db);"]
-    if mn == "PHD": return ["push16(cpu.d);"]
-    if mn == "PLD": return ["cpu.d = pull16(); NZ16(cpu.d);"]
+    if mn == "PHB": return ["push8(DB);"]
+    if mn == "PLB": return ["DB = pull8(); NZ8(DB);"]
+    if mn == "PHD": return ["push16(D);"]
+    if mn == "PLD": return ["D = pull16(); NZ16(D);"]
     if mn == "PHK": return ["push8(cpu.pb);"]
     if mn == "PHP": return ["push8(GETP());"]
     if mn == "PLP": return ["SETP(pull8());"]
@@ -509,7 +552,7 @@ def emit_op(i, w):
     if mn in ("MVN", "MVP"):
         dst, src = i.operand & 0xFF, i.operand >> 8
         step = "+ 1" if mn == "MVN" else "- 1"
-        return [f"cpu.db = {hx(dst, 2)}; do {{ wr8({hx(dst, 2)}0000 | Y, rd8({hx(src, 2)}0000 | X)); "
+        return [f"DB = {hx(dst, 2)}; do {{ wr8({hx(dst, 2)}0000 | Y, rd8({hx(src, 2)}0000 | X)); "
                 f"X = (uint16_t)(X {step}); Y = (uint16_t)(Y {step}); if (cpu.xf) {{ X &= 0xff; Y &= 0xff; }} "
                 f"}} while (A-- != 0);"]
     raise ValueError(f"no emitter for {mn} {mode} at {i.addr:06X}")
@@ -665,6 +708,14 @@ class RegionEmitter:
                 if len(cases) == 1:
                     w = cases[0][1]
                     body = emit_op(i, w)
+                    consts = const_cases(i)
+                    if consts:
+                        CONSTS.update(consts)
+                        fast = emit_op(i, w)
+                        CONSTS.clear()
+                        cond = " && ".join(f"{r} == {hx(k, 4 if r == 'D' else 2)}" for r, k in consts.items())
+                        body = [f"if ({cond}) {{"] + ["  " + b for b in fast] + \
+                               ["} else {"] + ["  " + b for b in body] + ["}"]
                     if w == 16:
                         cyc += 1
                 else:

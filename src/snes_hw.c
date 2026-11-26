@@ -12,7 +12,7 @@
 #endif
 
 EWRAM_DATA SnesHw g_hw;
-EWRAM_DATA uint8_t g_wram[0x20000];
+EWRAM_DATA __attribute__((aligned(4))) uint8_t g_wram[0x20000];
 EWRAM_DATA uint8_t g_sram[0x800];
 const uint8_t *g_rom;
 uint32_t g_rom_mask;

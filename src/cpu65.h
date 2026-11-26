@@ -43,14 +43,45 @@ typedef uint32_t (*RegionFn)(uint32_t entry);
 // EVENT_PENDING(), ASSUME_MX(m, x, pc).
 #include "platform_cpu.h"
 
-static inline uint16_t rd16(uint32_t a) { return rd8(a) | rd8((a + 1) & 0xffffff) << 8; }
+static inline __attribute__((always_inline)) uint16_t rd16(uint32_t a) {
+#ifdef WRAM_DIRECT
+  // A constant address in WRAM (7E/7F, or 00-3F/80-BF below $2000), even
+  if (__builtin_constant_p(a) && !(a & 1)) {
+    if ((a >> 17) == 0x3f) return *(const uint16_t *)(g_wram + (a & 0x1ffff));
+    if (!(a & 0x400000) && (a & 0xffff) < 0x2000) return *(const uint16_t *)(g_wram + (a & 0xffff));
+  }
+#endif
+  return rd8(a) | rd8((a + 1) & 0xffffff) << 8;
+}
 static inline uint32_t rd24(uint32_t a) {
   return rd8(a) | rd8((a + 1) & 0xffffff) << 8 | (uint32_t)rd8((a + 2) & 0xffffff) << 16;
 }
-static inline void wr16(uint32_t a, uint16_t v) { wr8(a, (uint8_t)v); wr8((a + 1) & 0xffffff, v >> 8); }
-// Bank 0's 16-bit accesses wrap within it.
-static inline uint16_t rd16_b0(uint16_t a) { return rd8_b0(a) | rd8_b0((uint16_t)(a + 1)) << 8; }
-static inline void wr16_b0(uint16_t a, uint16_t v) { wr8_b0(a, (uint8_t)v); wr8_b0((uint16_t)(a + 1), v >> 8); }
+static inline __attribute__((always_inline)) void wr16(uint32_t a, uint16_t v) {
+#ifdef WRAM_DIRECT
+  if (__builtin_constant_p(a) && !(a & 1)) {
+    if ((a >> 17) == 0x3f) { *(uint16_t *)(g_wram + (a & 0x1ffff)) = v; return; }
+    if (!(a & 0x400000) && (a & 0xffff) < 0x2000) { *(uint16_t *)(g_wram + (a & 0xffff)) = v; return; }
+  }
+#endif
+  wr8(a, (uint8_t)v);
+  wr8((a + 1) & 0xffffff, v >> 8);
+}
+// Bank 0's 16-bit accesses wrap within it. At an even address known when
+// compiling, in WRAM, where the platform keeps WRAM itself (WRAM_DIRECT):
+// one halfword access.
+static inline __attribute__((always_inline)) uint16_t rd16_b0(uint16_t a) {
+#ifdef WRAM_DIRECT
+  if (__builtin_constant_p(a) && !(a & 1) && a < 0x2000) return *(const uint16_t *)(g_wram + a);
+#endif
+  return rd8_b0(a) | rd8_b0((uint16_t)(a + 1)) << 8;
+}
+static inline __attribute__((always_inline)) void wr16_b0(uint16_t a, uint16_t v) {
+#ifdef WRAM_DIRECT
+  if (__builtin_constant_p(a) && !(a & 1) && a < 0x2000) { *(uint16_t *)(g_wram + a) = v; return; }
+#endif
+  wr8_b0(a, (uint8_t)v);
+  wr8_b0((uint16_t)(a + 1), v >> 8);
+}
 static inline uint32_t rd24_b0(uint16_t a) { return rd16_b0(a) | (uint32_t)rd8_b0((uint16_t)(a + 2)) << 16; }
 
 static inline void push8(uint8_t v) { wr8_b0(cpu.s, v); cpu.s--; }
@@ -76,14 +107,26 @@ uint32_t run_until_flag(uint32_t pc);
 uint32_t interrupt(uint16_t vector_addr, uint32_t resume_pc);
 
 // ---- what the generated code uses ----
-#define LOAD() uint16_t A = cpu.a, X = cpu.x, Y = cpu.y; uint8_t fN = cpu.n, fV = cpu.v, fZ = cpu.z, fC = cpu.c
-#define RELOAD() (A = cpu.a, X = cpu.x, Y = cpu.y, fN = cpu.n, fV = cpu.v, fZ = cpu.z, fC = cpu.c)
-#define SAVE() (cpu.a = A, cpu.x = X, cpu.y = Y, cpu.n = fN, cpu.v = fV, cpu.z = fZ, cpu.c = fC)
+// The registers and flags, and D and DB, are locals while a region runs
+// (so the compiler keeps them in registers: stores to WRAM, byte stores,
+// could change cpu's fields as far as it knows): saved before anything else
+// may look at them (a call, a return, an interrupt), reloaded after a call.
+#define LOAD() uint16_t A = cpu.a, X = cpu.x, Y = cpu.y, D = cpu.d; uint8_t DB = cpu.db; \
+    uint8_t fN = cpu.n, fV = cpu.v, fZ = cpu.z, fC = cpu.c
+#define RELOAD() (A = cpu.a, X = cpu.x, Y = cpu.y, D = cpu.d, DB = cpu.db, fN = cpu.n, fV = cpu.v, fZ = cpu.z, \
+    fC = cpu.c)
+#define SAVE() (cpu.a = A, cpu.x = X, cpu.y = Y, cpu.d = D, cpu.db = DB, cpu.n = fN, cpu.v = fV, cpu.z = fZ, \
+    cpu.c = fC)
 
 #define NZ8(r) (fN = ((r) >> 7) & 1, fZ = (uint8_t)(r) == 0)
 #define NZ16(r) (fN = ((r) >> 15) & 1, fZ = (uint16_t)(r) == 0)
-#define DP(o) ((uint16_t)(cpu.d + (o)))
-#define DBA(a) (((uint32_t)cpu.db << 16) | (uint16_t)(a))
+#define DP(o) ((uint16_t)(D + (o)))
+#define DBA(a) (((uint32_t)DB << 16) | (uint16_t)(a))
+// The same with D (DB) known: where the trace saw only one value of it at
+// an instruction, the instruction is emitted for that value (its address a
+// constant) and for any other, by a test of D (DB).
+#define KDP(k, o) ((uint16_t)((k) + (o)))
+#define KDB(k, a) (((uint32_t)(k) << 16) | (uint16_t)(a))
 #define PBA(a) (((uint32_t)cpu.pb << 16) | (uint16_t)(a))
 #define L24(a) ((a) & 0xffffff)
 #define SR(o) ((uint16_t)(cpu.s + (o)))

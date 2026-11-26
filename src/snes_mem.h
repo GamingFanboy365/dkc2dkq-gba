@@ -6,7 +6,8 @@
 
 #include <stdint.h>
 
-extern uint8_t g_wram[0x20000];
+extern uint8_t g_wram[0x20000];   // 4-byte aligned (snes_hw.c)
+#define WRAM_DIRECT 1                  // cpu65.h may access g_wram itself
 extern const uint8_t *g_rom;          // 4 MB, HiROM
 uint8_t rd8_slow(uint32_t addr);
 void wr8_slow(uint32_t addr, uint8_t value);
