@@ -17,6 +17,10 @@ Host tools for the port. Build them with the top-level CMake project:
   shows it decoded bytes at the wrong width, and writes C (one function per
   routine) for `src/cpu65.h`'s runtime. Its output is built from the ROM and
   never committed.
+- `make_cartridge.py`: the GBA cartridge: the engine, then the player's
+  ROM (checked by hash), with the header filled in.
+- `mgba/gbarun.c`: runs a GBA cartridge headless (pictures, savestates,
+  memory dumps); the cartridge's debug prints go to stdout.
 - `compare_sync.py`: compares the per-frame WRAM hashes of the reference
   (`snesrun SYNC=`) and the recompiled build (`hostrun SYNC=`).
 

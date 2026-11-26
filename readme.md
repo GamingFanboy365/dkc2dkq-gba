@@ -1,3 +1,5 @@
+**The GBA port:** see `docs/PORT.md`.
+
 ### Building: bring your own ROM
 
 This repository holds no game data. Graphics, levels, music and other data

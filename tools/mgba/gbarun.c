@@ -26,6 +26,9 @@
  *               0x03000000)                                  [MEMDUMP=1]
  *   -q          quiet (no per-shot log lines)
  *
+ * What the game prints through mGBA's debug registers (0x04FFF600) goes to
+ * stdout, a line per message.
+ *
  * Key script: comma-separated segments "COUNT:KEYS", where COUNT is a number
  * of frames and KEYS is "-" (nothing held) or key names joined by '+':
  *   A B L R START SELECT UP DOWN LEFT RIGHT  (case-insensitive; U/D/LT/RT ok)
@@ -275,7 +278,14 @@ static void writeState(struct mCore* core, const char* path) {
 
 static void quietLog(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
 	(void) logger;
-	(void) category;
+	/* What the game prints through mGBA's debug registers goes to stdout. */
+	const char* id = mLogCategoryId(category);
+	if (id && strcmp(id, "gba.debug") == 0) {
+		vprintf(format, args);
+		putchar('\n');
+		fflush(stdout);
+		return;
+	}
 	if (level & (mLOG_FATAL | mLOG_ERROR)) {
 		vfprintf(stderr, format, args);
 		fputc('\n', stderr);

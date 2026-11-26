@@ -18,3 +18,4 @@ DMA_log*
 *.sox
 *.trace
 build*/
+__pycache__/
