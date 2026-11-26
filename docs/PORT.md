@@ -19,16 +19,19 @@ code or a cartridge.
   it is; the M/X register widths come from a flow analysis and a trace of
   the original (`traces/`). The trace also corrects the disassembly where it
   decoded bytes at the wrong width (`$B5A262`).
-- **Checked against an emulator**: from power on through the Rareware and
-  Nintendo logos to the title screen (3000 frames), WRAM after every frame
-  matches the original running on LakeSnes, on LakeSnes's hardware
-  (`hostrun`) and on the port's own hardware model (`hostmini`), whose
-  VRAM and CGRAM also match at the title.
+- **Checked against an emulator**: WRAM after every frame of the game's
+  logic matches the original running on LakeSnes, on LakeSnes's hardware
+  (`hostrun`) and on the port's own hardware model (`hostmini`), over two
+  sessions: power on to the title screen (2805 game frames; VRAM and CGRAM
+  match there too), and a scripted play session (6193 game frames: file
+  select, the world map, Pirate Panic with runs, jumps, rolls, team-ups,
+  swaps, pauses, a death, the map again and back in).
 - **On the GBA**: the same code and model run on the GBA (mGBA), and the
   states it reached (1622, to the title) match the reference too.
 - **Not yet**: nothing is drawn or played on the GBA (the PPU's state is
-  recorded, not rendered; the sound CPU only answers handshakes). Nothing
-  past the title is verified: the traces cover the boot and the title only.
+  recorded, not rendered; the sound CPU only answers handshakes). Only the
+  first level is verified: code the traces haven't seen run may have
+  entries or register widths the recompiler doesn't know.
 
 ## Speed, before any optimization
 
@@ -58,6 +61,13 @@ You need clang/lld (18), cmake, Python 3, libpng, asar 1.9, and your ROM.
     cmake --build build -j4
     FRAMES=3000 SYNC=ref.sync build/snesrun baserom.sfc     # the reference
     FRAMES=3000 SYNC=mini.sync build/hostmini baserom.sfc   # the port's model
+    tools/compare_sync.py ref.sync mini.sync
+
+    # The play session (the script's frames are the game's own, so every
+    # build sees the same buttons):
+    export KEYS=$(tools/scripts/make_play_script.py 1 6000) FRAMES=8000
+    SYNC=ref.sync build/snesrun baserom.sfc
+    SYNC=mini.sync build/hostmini baserom.sfc
     tools/compare_sync.py ref.sync mini.sync
 
     # The GBA cartridge (build-gba/dkc2.gba):

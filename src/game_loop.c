@@ -10,6 +10,7 @@
 uint32_t g_cycles, g_frame_end;
 static uint32_t g_pc;
 static bool g_nmi_since_wait;
+static uint16_t g_joy1;
 
 void game_reset(void) {
   hw_reset();
@@ -21,19 +22,19 @@ void game_reset(void) {
   g_nmi_since_wait = true;
 }
 
-bool game_frame(uint16_t joy1) {
+bool game_frame(void) {
   uint32_t r = run_until_flag(g_pc);
   if (r & PC_STOP) return false;
   uint32_t resume = r & 0xffffff;
   if ((r & PC_YIELD) && g_nmi_since_wait) {
     g_nmi_since_wait = false;
-    on_wait((resume & 0xff0000) | ((resume - 1) & 0xffff));
+    g_joy1 = on_wait((resume & 0xff0000) | ((resume - 1) & 0xffff));
   }
   // VBlank. The clock starts the next frame from here: a frame the game
   // waited in ends early, a lag frame late.
   if (g_cycles < g_frame_end) g_cycles = g_frame_end;
   g_frame_end = g_cycles + MASTER_CYCLES_PER_FRAME;
-  hw_vblank(joy1);
+  hw_vblank(g_joy1);
   if (hw_nmi_enabled()) {
     g_hw.in_nmi = 1;
     g_pc = interrupt(0xffea, resume);

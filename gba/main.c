@@ -9,25 +9,22 @@
 #include "game_loop.h"
 #include "gba_hw.h"
 #include "snes_hw.h"
+#include "sync_hash.h"
 
 extern const uint32_t g_snes_rom_offset;   // crt0.S, set by make_cartridge.py
 
 static int g_frame;
 
-#ifdef SYNC_LOG
-static uint32_t hash_ram(const uint8_t *p, uint32_t n) {
-  uint32_t h = 2166136261u;
-  for (uint32_t i = 0; i < n; i++) h = (h ^ (i == 0x2c || i == 0x2d ? 0 : p[i])) * 16777619u;
-  return h;
-}
-#endif
 
-void on_wait(uint32_t wai_pc) {
+static uint16_t read_joypad(void);
+
+uint16_t on_wait(uint32_t wai_pc) {
 #ifdef SYNC_LOG
-  debug_printf("sync %d %08x %06x", g_frame, hash_ram(g_wram, sizeof(g_wram)), wai_pc);
+  debug_printf("sync %d %08x %06x", g_frame, sync_hash(g_wram), wai_pc);
 #else
   (void)wai_pc;
 #endif
+  return read_joypad();
 }
 
 void unknown_entry(uint32_t pc) {
@@ -69,7 +66,7 @@ int main(void) {
   int in_window = 0;
   for (g_frame = 0;; g_frame++) {
     uint32_t t0 = cycles_now();
-    bool ok = game_frame(read_joypad());
+    bool ok = game_frame();
     uint32_t t = cycles_now() - t0;
     total += t;
     if (t > worst) worst = t;

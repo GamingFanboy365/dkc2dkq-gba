@@ -30,5 +30,8 @@ The recompiled game on the PC is `host/hostrun.c`. A check run:
     FRAMES=3000 SYNC=host.sync build/hostrun baserom.sfc
     tools/compare_sync.py ref.sync host.sync
 
+`scripts/make_play_script.py` prints the button script of the play session
+(`traces/play1.trace` is `snesrun TRACE=` over it, 8000 frames).
+
 `traces/` holds the reference's CPU traces (`snesrun TRACE=`): addresses
 and flags only, no game data.

@@ -11,20 +11,17 @@
 #include "cpu65.h"
 #include "game_loop.h"
 #include "snes_hw.h"
+#include "sync_hash.h"
 
-static int g_frame;
+static int g_frame, g_num_waits;
+static KeyScript g_keys;
 static FILE *g_sync;
 static int g_dumps[4096], g_num_dumps;
 static const char *g_out = ".";
 
-static uint32_t hash_ram(const uint8_t *p, size_t n) {
-  uint32_t h = 2166136261u;
-  for (size_t i = 0; i < n; i++) h = (h ^ (i == 0x2c || i == 0x2d ? 0 : p[i])) * 16777619u;
-  return h;
-}
 
-void on_wait(uint32_t wai_pc) {
-  if (g_sync) fprintf(g_sync, "%d %08x %06x\n", g_frame, hash_ram(g_wram, sizeof(g_wram)), wai_pc);
+uint16_t on_wait(uint32_t wai_pc) {
+  if (g_sync) fprintf(g_sync, "%d %08x %06x\n", g_frame, sync_hash(g_wram), wai_pc);
   if (int_list_has(g_dumps, g_num_dumps, g_frame)) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/mini_wram_%05d.bin", g_out, g_frame);
@@ -34,6 +31,7 @@ void on_wait(uint32_t wai_pc) {
     snprintf(path, sizeof(path), "%s/mini_cgram_%05d.bin", g_out, g_frame);
     write_file(path, g_hw.cgram, sizeof(g_hw.cgram));
   }
+  return keyscript_at(&g_keys, g_num_waits++);
 }
 
 void unknown_entry(uint32_t pc) {
@@ -56,14 +54,13 @@ int main(int argc, char **argv) {
   g_rom = rom;
   g_rom_mask = (uint32_t)size - 1;
   int frames = getenv("FRAMES") ? atoi(getenv("FRAMES")) : 600;
-  KeyScript keys;
-  if (!keyscript_parse(&keys, getenv("KEYS"))) { fprintf(stderr, "bad KEYS\n"); return 1; }
+  if (!keyscript_parse(&g_keys, getenv("KEYS"))) { fprintf(stderr, "bad KEYS\n"); return 1; }
   if (getenv("SYNC")) g_sync = fopen(getenv("SYNC"), "w");
   if (getenv("OUT")) g_out = getenv("OUT");
   g_num_dumps = parse_int_list(getenv("DUMPS"), g_dumps, 4096);
   game_reset();
   for (g_frame = 0; g_frame < frames; g_frame++) {
-    if (!game_frame(keyscript_at(&keys, g_frame))) {
+    if (!game_frame()) {
       fprintf(stderr, "frame %d: the game stopped\n", g_frame);
       break;
     }
