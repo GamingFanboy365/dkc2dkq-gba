@@ -453,15 +453,72 @@ void hw_hdma_begin(void) {
   }
 }
 
+// The same as hw_hdma_begin and 224 hw_hdma_line calls, on a copy of the
+// active channels' state in fast memory (g_hw is in the GBA's EWRAM).
 HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
   hw_hdma_begin();
+  struct {
+    uint32_t table, indirect;
+    uint8_t lines, do_transfer, active, c;
+  } ch[8];
+  int n = 0;
+  for (int c = 0; c < 8; c++) {
+    if (!g_hw.hdma[c].active) continue;
+    ch[n].table = g_hw.hdma[c].table;
+    ch[n].indirect = g_hw.hdma[c].indirect;
+    ch[n].lines = g_hw.hdma[c].lines;
+    ch[n].do_transfer = g_hw.hdma[c].do_transfer;
+    ch[n].active = 1;
+    ch[n].c = (uint8_t)c;
+    n++;
+  }
   for (int line = 0; line < 224; line++) {
-    hw_hdma_line();
+    for (int k = 0; k < n; k++) {
+      if (!ch[k].active) continue;
+      const uint8_t *r = g_hw.dma[ch[k].c];
+      bool indirect = r[0] & 0x40;
+      uint32_t bank = ch[k].table & 0xff0000;
+      uint16_t t = (uint16_t)ch[k].table;
+      if (ch[k].do_transfer) {
+        uint8_t mode = r[0] & 7;
+        for (int i = 0; i < kTransferLength[mode]; i++) {
+          uint8_t v;
+          if (indirect) {
+            v = rd8(ch[k].indirect);
+            ch[k].indirect = (ch[k].indirect & 0xff0000) | (uint16_t)(ch[k].indirect + 1);
+          } else {
+            v = rd8(bank | t++);
+          }
+          bbus_write((uint8_t)(r[1] + kBAdrOffsets[mode][i]), v);
+        }
+      }
+      ch[k].lines--;
+      ch[k].do_transfer = ch[k].lines >> 7;
+      if ((ch[k].lines & 0x7f) == 0) {
+        ch[k].lines = rd8(bank | t++);
+        if (indirect) {
+          uint16_t ind = rd8(bank | t) | rd8(bank | (uint16_t)(t + 1)) << 8;
+          t += 2;
+          ch[k].indirect = (uint32_t)r[7] << 16 | ind;
+        }
+        if (ch[k].lines == 0) ch[k].active = 0;
+        ch[k].do_transfer = 1;
+      }
+      ch[k].table = bank | t;
+    }
     if (after_line) after_line(line);
+  }
+  for (int k = 0; k < n; k++) {
+    int c = ch[k].c;
+    g_hw.hdma[c].table = ch[k].table;
+    g_hw.hdma[c].indirect = ch[k].indirect;
+    g_hw.hdma[c].lines = ch[k].lines;
+    g_hw.hdma[c].do_transfer = ch[k].do_transfer;
+    g_hw.hdma[c].active = ch[k].active;
   }
 }
 
-HOT_CODE void hw_hdma_line(void) {
+void hw_hdma_line(void) {   // (hostmini; the GBA runs hw_hdma_frame)
   for (int c = 0; c < 8; c++) {
     if (!g_hw.hdma[c].active) continue;
     const uint8_t *r = g_hw.dma[c];

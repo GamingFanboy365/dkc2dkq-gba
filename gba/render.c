@@ -48,6 +48,7 @@
 // sprites made of the same lines (draw_sprites_squeezed).
 static int g_view_top = -1, g_view_lines;
 static uint8_t g_src_line[LINES];
+static uint8_t g_line_used[224];        // per SNES line: shown
 static uint8_t g_first_gba_line[225];   // per SNES line: the first GBA line showing it or one below
 
 // a / b (there's no division in this build's C library); rarely called.
@@ -69,6 +70,8 @@ void render_set_view(int top, int lines) {
   g_view_top = top;
   g_view_lines = lines;
   for (int y = 0; y < LINES; y++) g_src_line[y] = (uint8_t)(top + udiv(y * lines, LINES));
+  for (int sy = 0; sy < 224; sy++) g_line_used[sy] = 0;
+  for (int y = 0; y < LINES; y++) g_line_used[g_src_line[y]] = 1;
   for (int sy = 0, g = 0; sy <= 224; sy++) {
     while (g < LINES && g_src_line[g] < sy) g++;
     g_first_gba_line[sy] = (uint8_t)g;
@@ -95,7 +98,7 @@ void render_set_view(int top, int lines) {
 
 // ---- what the VBlank interrupt puts on screen ----
 
-#define MAX_LINE_COLORS 4             // CGRAM entries HDMA may rewrite, followed
+#define MAX_LINE_COLORS 2             // CGRAM entries HDMA may rewrite, followed
 
 typedef struct {
   uint16_t oam[128 * 4];
@@ -107,10 +110,11 @@ typedef struct {
   bool per_line_scroll, per_line_fixed, per_line_regs;
   // Per line, when the layers or color math change down the screen
   // (per_line_regs): DISPCNT, BLDCNT, BLDALPHA, the three BGs' priorities
-  // (2 bits each, for BG0-2CNT), and the colors HDMA rewrites (each in GBA
+  // (2 bits each, for BG0-2CNT; bits 6 and 7: color math inside and outside
+  // WIN0, the SNES's color window), WIN0H, and the colors HDMA rewrites (each in GBA
   // palette entries pal_index[k][0] and, if not 0, [1]), set by the HBlank
   // interrupt.
-  uint16_t line_regs[LINES][4];
+  uint16_t line_regs[LINES][5];
   uint16_t bgcnt_base[3];
   uint8_t num_line_colors;
   uint16_t pal_index[MAX_LINE_COLORS][2];
@@ -357,27 +361,37 @@ static uint32_t g_visible_rows[3];       // GBA map rows shown this frame (bits)
 static uint8_t g_row_col0[3][32];        // the first GBA column shown in each (0xff: all)
 
 static uint16_t g_hofs[3][224], g_vofs[3][224];
-static uint16_t g_fixed_line[224];
+EWRAM_DATA static uint16_t g_fixed_line[224];
+// Per SNES line, the color window (W1, or W2 if W1 is off): left, right,
+// bit 16 on, bit 17 inverted.
+EWRAM_DATA static uint32_t g_line_win[224];
 
 // Per SNES line, what HDMA may change besides the scroll: the main and
 // sub screens' layers, color math's settings, and up to MAX_LINE_COLORS
-// CGRAM entries (for lines before an entry's first write, its value then:
-// the hook sees a write before it's made).
+// CGRAM entries (note_cgram_write).
 static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
 static uint8_t g_hdma_color[MAX_LINE_COLORS], g_num_hdma_colors;
 EWRAM_DATA static uint16_t g_line_color[224][MAX_LINE_COLORS];
-static int g_hdma_line;
 
-static void hdma_write_hook(uint8_t reg, uint8_t value) {
-  (void)value;
-  if (reg != 0x22 || !g_hw.cgram_second_write) return;
-  uint8_t c = g_hw.cgram_pointer;
+// A line's CGRAM write (CGRAM's write count moved by a whole color): the
+// color before the pointer. Colors followed last frame start from their
+// value before this frame's HDMA (g_cgram_start); new ones from their first
+// written value.
+static uint16_t g_cgram_ver_seen;
+static uint8_t g_prev_colors[MAX_LINE_COLORS], g_num_prev_colors;
+static uint16_t g_cgram_start[MAX_LINE_COLORS];
+
+static void note_cgram_write(int line) {
+  uint8_t c = (uint8_t)(g_hw.cgram_pointer - 1);
   for (int k = 0; k < g_num_hdma_colors; k++)
     if (g_hdma_color[k] == c) return;
   if (g_num_hdma_colors == MAX_LINE_COLORS) return;
   int k = g_num_hdma_colors++;
   g_hdma_color[k] = c;
-  for (int line = 0; line < g_hdma_line; line++) g_line_color[line][k] = g_hw.cgram[c];
+  uint16_t before = g_hw.cgram[c];
+  for (int j = 0; j < g_num_prev_colors; j++)
+    if (g_prev_colors[j] == c) before = g_cgram_start[j];
+  for (int l = 0; l < line; l++) g_line_color[l][k] = before;
 }
 
 static uint8_t g_line_mode[224];   // BGMODE per SNES line
@@ -400,6 +414,9 @@ static void mode7_line(int line, int32_t *x, int32_t *y) {
 }
 
 IWRAM_CODE static void capture_line(int line) {
+  if ((uint16_t)(g_hw.cgram_ver - g_cgram_ver_seen) >= 2) note_cgram_write(line);
+  g_cgram_ver_seen = g_hw.cgram_ver;
+  if (!g_line_used[line]) return;   // a line the view leaves out
   for (int b = 0; b < 3; b++) {
     g_hofs[b][line] = g_hw.hofs[b];
     g_vofs[b][line] = g_hw.vofs[b];
@@ -408,9 +425,15 @@ IWRAM_CODE static void capture_line(int line) {
   g_line_tm[line] = g_hw.regs[0x2c];
   g_line_ts[line] = g_hw.regs[0x2d];
   g_line_cgwsel[line] = g_hw.regs[0x30];
+  uint8_t wsel = g_hw.regs[0x25] >> 4;
+  if (wsel & 2)
+    g_line_win[line] = g_hw.regs[0x26] | g_hw.regs[0x27] << 8 | 1u << 16 | (uint32_t)(wsel & 1) << 17;
+  else if (wsel & 8)
+    g_line_win[line] = g_hw.regs[0x28] | g_hw.regs[0x29] << 8 | 1u << 16 | (uint32_t)(wsel & 4) << 15;
+  else
+    g_line_win[line] = 0;
   g_line_cgadsub[line] = g_hw.regs[0x31];
   for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_hw.cgram[g_hdma_color[k]];
-  g_hdma_line = line + 1;
   g_line_mode[line] = g_hw.regs[0x05];
 }
 
@@ -452,7 +475,7 @@ static void evict_hidden(void) {
 }
 
 // The screen's brightness, applied to the palette: c * b / 15 per channel.
-static uint8_t g_scale[16][32];
+EWRAM_DATA static uint8_t g_scale[16][32];
 
 static uint16_t scale_color(uint16_t c, int b) {
   const uint8_t *t = g_scale[b];
@@ -492,7 +515,7 @@ IWRAM_CODE static void draw_row(int b, uint32_t row_base, uint32_t col0, bool wi
 #ifdef RENDER_DEBUG
 static uint32_t g_dbg_search, g_dbg_rows[3];
 #endif
-__attribute__((noinline)) static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
+IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
   uint8_t sc = g_hw.regs[0x07 + b];
   uint32_t map_base = (uint32_t)(sc & 0xfc) << 8;     // words
   bool wide = sc & 1, tall = sc & 2;
@@ -589,7 +612,7 @@ __attribute__((noinline)) static void draw_bg(int b, int bpp, bool main_screen, 
 
 static uint32_t g_obj_base_seen = 0xffffffff, g_obj_gap_seen;
 
-IWRAM_CODE static void convert_obj_tile(uint32_t t, uint32_t base, uint32_t gap) {
+static void convert_obj_tile(uint32_t t, uint32_t base, uint32_t gap) {
   uint32_t w = ((t < 256 ? base : base + gap) + (t & 255) * 16) & 0x7fff;
   const uint16_t *src = &g_hw.vram[w];
   const uint32_t *ex = g_expand;
@@ -889,11 +912,14 @@ IWRAM_CODE void render_frame(void) {
   Frame *f = &g_frames[fi];
 
   // HDMA writes the registers line by line; note them at each line.
+  g_num_prev_colors = g_num_hdma_colors;
+  for (int k = 0; k < g_num_hdma_colors; k++) {
+    g_prev_colors[k] = g_hdma_color[k];
+    g_cgram_start[k] = g_hw.cgram[g_hdma_color[k]];
+  }
   g_num_hdma_colors = 0;
-  g_hdma_line = 0;
-  g_ppu_write_hook = hdma_write_hook;
+  g_cgram_ver_seen = g_hw.cgram_ver;
   hw_hdma_frame(capture_line);
-  g_ppu_write_hook = 0;
 
   // The mode: the middle line's.
   uint8_t inidisp = g_hw.regs[0x00], mode = g_line_mode[g_src_line[LINES / 2]] & 7;
@@ -963,18 +989,20 @@ IWRAM_CODE void render_frame(void) {
     f->bgcnt_base[b] = bgcnt_base[b];
   }
   f->per_line_regs = false;
-  uint32_t last_state = 0xffffffff;
+  uint32_t last_state = 0xffffffff, last_win = 0xffffffff;
   for (int gy = 0; gy < LINES; gy++) {
     int sy = g_src_line[gy];
     uint32_t state = (uint32_t)g_line_tm[sy] | g_line_ts[sy] << 8 | g_line_cgwsel[sy] << 16 |
                      (uint32_t)g_line_cgadsub[sy] << 24;
-    if (state == last_state) {
+    uint32_t win = g_line_win[sy];
+    if (state == last_state && win == last_win) {
       // As the line before: the same registers.
       uint16_t *r = f->line_regs[gy], *q = f->line_regs[gy - 1];
-      r[0] = q[0]; r[1] = q[1]; r[2] = q[2]; r[3] = q[3];
+      r[0] = q[0]; r[1] = q[1]; r[2] = q[2]; r[3] = q[3]; r[4] = q[4];
       continue;
     }
     last_state = state;
+    last_win = win;
     uint8_t bgs = mode == 3 ? 0x03 : 0x07;   // the mode's BGs (of BG1-3)
     uint8_t tm = g_line_tm[sy] & (0x10 | bgs), cgadsub = g_line_cgadsub[sy], cgwsel = g_line_cgwsel[sy];
     bool math = modes01 && (cgadsub & 0x3f) && !(cgadsub & 0x80) && (cgwsel & 0x30) != 0x30;
@@ -1018,13 +1046,35 @@ IWRAM_CODE void render_frame(void) {
       deepest = pr;
       placed |= (uint8_t)(1 << b);
     }
+    // The color window: CGWSEL's bits 4-5 keep color math out of it (2) or
+    // in it (1) only. On the GBA, WIN0 over the span the window's edges
+    // make, color math on inside it, outside it, or both.
+    uint16_t win0h = 0, wdisp = 0;
+    uint32_t math_in = 1, math_out = 1;
+    uint8_t prevent = (cgwsel >> 4) & 3;
+    if (math && (prevent == 1 || prevent == 2)) {
+      bool on = win & (1u << 16), inv = win & (1u << 17);
+      int x1 = (int)(win & 0xff) - CROP_X, x2 = (int)((win >> 8) & 0xff) + 1 - CROP_X;
+      if (x1 < 0) x1 = 0;
+      if (x2 > 240) x2 = 240;
+      bool in_win = on && !inv, out_win = on && inv;   // the window's state inside the span, outside it
+      math_in = !((prevent == 2 && in_win) || (prevent == 1 && !in_win));
+      math_out = !((prevent == 2 && out_win) || (prevent == 1 && !out_win));
+      if (!on || x1 >= x2) math_in = math_out;   // no span
+      if (!math_in && !math_out) bldcnt = 0;
+      else if (math_in != math_out) {
+        wdisp = 0x2000;
+        win0h = (uint16_t)(x1 << 8 | x2);
+      }
+    }
     uint16_t *r = f->line_regs[gy];
-    r[0] = dispcnt_base | layers;
+    r[0] = dispcnt_base | layers | wdisp;
     r[1] = bldcnt;
     r[2] = bldalpha;
-    r[3] = (uint16_t)(prio[0] | prio[1] << 2 | prio[2] << 4);
+    r[3] = (uint16_t)(prio[0] | prio[1] << 2 | prio[2] << 4 | math_in << 6 | math_out << 7);
+    r[4] = win0h;
     if (gy)
-      for (int k = 0; k < 4; k++)
+      for (int k = 0; k < 5; k++)
         if (r[k] != f->line_regs[0][k]) f->per_line_regs = true;
   }
   uint16_t dispcnt = f->line_regs[0][0];
@@ -1161,6 +1211,14 @@ static void dma3_copy32(volatile void *dst, const void *src, uint32_t words) {
   REG_DMA3CNT = words | 0x84000000u;   // enable, 32-bit
 }
 
+// A line's WIN0: its span, and color math inside and outside it.
+static inline void set_window(const uint16_t *r) {
+  REG16(0x04000040) = r[4];
+  REG16(0x04000044) = 160;   // WIN0V: all lines
+  REG16(0x04000048) = (uint16_t)(0x1f | ((r[3] >> 6) & 1) << 5);
+  REG16(0x0400004a) = (uint16_t)(0x1f | ((r[3] >> 7) & 1) << 5);
+}
+
 void render_hold(int frames) {
   while (g_pending >= 0) {}
   uint32_t v = g_vblanks;
@@ -1180,6 +1238,7 @@ void render_vblank(void) {
     REG16(0x04000050) = f->bldcnt;
     REG16(0x04000052) = f->bldalpha;
     REG_DISPCNT = f->dispcnt;
+    set_window(f->line_regs[0]);
     g_pending = -1;
   }
   const Frame *f = &g_frames[g_shown];
@@ -1196,6 +1255,7 @@ void render_vblank(void) {
     REG_DISPCNT = f->line_regs[0][0];
     REG16(0x04000050) = f->line_regs[0][1];
     REG16(0x04000052) = f->line_regs[0][2];
+    set_window(f->line_regs[0]);
     for (int b = 0; b < 3; b++)
       REG16(0x04000008 + b * 2) = f->bgcnt_base[b] | ((f->line_regs[0][3] >> (2 * b)) & 3);
     for (uint32_t k = 0; k < f->num_line_colors; k++) {
@@ -1231,6 +1291,7 @@ IWRAM_CODE void render_hblank(void) {
   REG_DISPCNT = r[0];
   REG16(0x04000050) = r[1];
   REG16(0x04000052) = r[2];
+  set_window(r);
   uint32_t pr = r[3];
   REG16(0x04000008) = f->bgcnt_base[0] | (pr & 3);
   REG16(0x0400000a) = f->bgcnt_base[1] | ((pr >> 2) & 3);
