@@ -143,12 +143,14 @@ static void ppu_write(uint8_t adr, uint8_t val) {
     case 0x18: {
       uint16_t a = vram_remap() & 0x7fff;
       g_hw.vram[a] = (g_hw.vram[a] & 0xff00) | val;
+      g_hw.vram_ver[a >> 3]++;
       if (!g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }
     case 0x19: {
       uint16_t a = vram_remap() & 0x7fff;
       g_hw.vram[a] = (uint16_t)((g_hw.vram[a] & 0x00ff) | val << 8);
+      g_hw.vram_ver[a >> 3]++;
       if (g_hw.vram_increment_on_high) g_hw.vram_pointer += g_hw.vram_increment;
       break;
     }

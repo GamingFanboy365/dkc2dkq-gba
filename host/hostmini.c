@@ -9,7 +9,8 @@
 //                   from the model's state at the game's Nth waits
 //                   (mini_shot_N.png): LakeSnes's PPU, given the model's
 //                   VRAM, CGRAM, OAM and registers, with the model's HDMA
-//                   run line by line)
+//                   run line by line; HIDE=MASK leaves layers out of them:
+//                   bit 0 BG1 ... bit 3 BG4, bit 4 sprites)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +35,12 @@ static const char *g_out = ".";
 static Snes *g_ref;
 static int g_shots[4096], g_num_shots;
 
-static void ref_write(uint8_t reg, uint8_t value) { ppu_write(g_ref->ppu, reg, value); }
+static int g_hide_layers;   // HIDE=mask: leave these layers out of the pictures (bit 0 BG1 .. 4 OBJ)
+
+static void ref_write(uint8_t reg, uint8_t value) {
+  if (reg == 0x2c || reg == 0x2d) value &= ~g_hide_layers;
+  ppu_write(g_ref->ppu, reg, value);
+}
 
 static void ref_load_state(void) {
   Ppu *ppu = g_ref->ppu;
@@ -45,7 +51,7 @@ static void ref_load_state(void) {
   memcpy(ppu->highOam, g_hw.high_oam, sizeof(ppu->highOam));
   for (int r = 0; r < 0x34; r++) {
     if ((r >= 0x02 && r <= 0x04) || (r >= 0x0d && r <= 0x22) || r == 0x32) continue;
-    ppu_write(ppu, (uint8_t)r, g_hw.regs[r]);
+    ref_write((uint8_t)r, g_hw.regs[r]);
   }
   for (int i = 0; i < 4; i++) {
     ppu_write(ppu, (uint8_t)(0x0d + i * 2), (uint8_t)g_hw.hofs[i]);
@@ -162,6 +168,7 @@ int main(int argc, char **argv) {
   g_num_dumps = parse_int_list(getenv("DUMPS"), g_dumps, 4096);
   g_num_regdumps = parse_int_list(getenv("REGS"), g_regdumps, 4096);
   g_num_shots = parse_int_list(getenv("SHOTS"), g_shots, 4096);
+  if (getenv("HIDE")) g_hide_layers = (int)strtol(getenv("HIDE"), NULL, 0);
   game_reset();
   for (g_frame = 0; g_frame < frames; g_frame++) {
     if (!game_frame()) {

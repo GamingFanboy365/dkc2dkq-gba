@@ -8,6 +8,7 @@
 #include "cpu65.h"
 #include "game_loop.h"
 #include "gba_hw.h"
+#include "render.h"
 #include "snes_hw.h"
 #include "sync_hash.h"
 
@@ -18,13 +19,46 @@ static int g_frame;
 
 static uint16_t read_joypad(void);
 
+void irq_handler(void) {
+  uint16_t flags = REG_IF;
+  if (flags & 1) render_vblank();
+  REG_IF = flags;
+  REG_BIOS_IF |= flags;
+}
+
+#ifdef TEST_KEYS
+#include "test_keys.h"   // generated from DKC2_TEST_KEYS: g_test_keys[][2]
+#endif
+static int g_waits;
+
 uint16_t on_wait(uint32_t wai_pc) {
+  render_frame();
+#ifdef SHOT_LOG
+  // gbarun -t takes the picture in the frame after this one: keep it there.
+  static const int kShots[] = {SHOT_LOG};
+  for (unsigned i = 0; i < sizeof(kShots) / sizeof(kShots[0]); i++)
+    if (kShots[i] == g_waits) {
+      debug_printf("shot %d", g_waits);
+      render_hold(2);
+    }
+#endif
 #ifdef SYNC_LOG
   debug_printf("sync %d %08x %06x", g_frame, sync_hash(g_wram), wai_pc);
 #else
   (void)wai_pc;
 #endif
+#ifdef TEST_KEYS
+  // The script's frames are the game's own, as in snesrun.
+  uint32_t n = g_waits++, at = 0;
+  for (uint32_t i = 0; i < sizeof(g_test_keys) / sizeof(g_test_keys[0]); i++) {
+    at += g_test_keys[i][0];
+    if (n < at) return g_test_keys[i][1];
+  }
+  return 0;
+#else
+  g_waits++;
   return read_joypad();
+#endif
 }
 
 void unknown_entry(uint32_t pc) {
@@ -61,6 +95,10 @@ int main(void) {
   g_rom_mask = 0x3fffff;
   debug_printf("SNES ROM at %08x", (uint32_t)g_rom);
   cycles_start();
+  render_init();
+  REG_DISPSTAT = 1 << 3;   // VBlank interrupt
+  REG_IE = 1;
+  REG_IME = 1;
   game_reset();
   uint32_t total = 0, worst = 0;
   int in_window = 0;

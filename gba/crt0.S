@@ -40,8 +40,23 @@ start:
     strlt   r3, [r1], #4
     blt     3b
 
+    ldr     r0, =irq_entry          @ the BIOS calls [0x03007FFC] on an interrupt
+    ldr     r1, =0x03007ffc
+    str     r0, [r1]
+
     ldr     r0, =main
     mov     lr, pc
     bx      r0
 4:  b       4b
+
+@ Interrupts: the BIOS has saved r0-r3, r12 and lr and is in IRQ mode, in
+@ ARM; irq_handler (C, Thumb) does the work.
+    .global irq_entry
+irq_entry:
+    stmfd   sp!, {lr}
+    ldr     r0, =irq_handler
+    mov     lr, pc
+    bx      r0
+    ldmfd   sp!, {lr}
+    bx      lr
     .pool

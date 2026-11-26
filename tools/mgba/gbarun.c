@@ -21,13 +21,16 @@
  *   -W FRAME    frame after which to write -w (default: end) [STATE_OUT_AT]
  *   -S FILE     battery save file (copied in memory; the file
  *               is never modified)                           [SAVE]
- *   -m          at every shot frame also dump work RAM: DIR/PREFIX_%06d.ewram
- *               (256 KiB from 0x02000000) and .iwram (32 KiB from
- *               0x03000000)                                  [MEMDUMP=1]
+ *   -m          at every shot frame also dump memory: DIR/PREFIX_%06d.ewram
+ *               (256 KiB from 0x02000000), .iwram (32 KiB from 0x03000000),
+ *               .vram (96 KiB), .pal (1 KiB) and .oam (1 KiB)  [MEMDUMP=1]
  *   -q          quiet (no per-shot log lines)
  *
  * What the game prints through mGBA's debug registers (0x04FFF600) goes to
- * stdout, a line per message.
+ * stdout, a line per message. With SHOT_ON=1 (or -t), a message "shot N"
+ * instead takes a picture, named by N, of the frame after the one it was
+ * printed in (what the game drew then is shown from the next VBlank); the
+ * game must keep that picture on screen for two frames.
  *
  * Key script: comma-separated segments "COUNT:KEYS", where COUNT is a number
  * of frames and KEYS is "-" (nothing held) or key names joined by '+':
@@ -262,6 +265,9 @@ static void dumpRegion(struct mCore* core, const char* dir, const char* prefix, 
 static void dumpMemory(struct mCore* core, const char* dir, const char* prefix, unsigned frame) {
 	dumpRegion(core, dir, prefix, frame, "ewram", 0x02000000, 0x40000);
 	dumpRegion(core, dir, prefix, frame, "iwram", 0x03000000, 0x8000);
+	dumpRegion(core, dir, prefix, frame, "vram", 0x06000000, 0x18000);
+	dumpRegion(core, dir, prefix, frame, "pal", 0x05000000, 0x400);
+	dumpRegion(core, dir, prefix, frame, "oam", 0x07000000, 0x400);
 }
 
 static void writeState(struct mCore* core, const char* path) {
@@ -276,13 +282,26 @@ static void writeState(struct mCore* core, const char* path) {
 	printf("state %s\n", path);
 }
 
+/* SHOT_ON: the game asks for a picture by printing "shot N". */
+static bool shotOnPrint;
+static int printedShot = -1, printedShotCountdown;
+
 static void quietLog(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
 	(void) logger;
 	/* What the game prints through mGBA's debug registers goes to stdout. */
 	const char* id = mLogCategoryId(category);
 	if (id && strcmp(id, "gba.debug") == 0) {
-		vprintf(format, args);
-		putchar('\n');
+		char line[512];
+		vsnprintf(line, sizeof(line), format, args);
+		int n;
+		if (shotOnPrint && sscanf(line, "shot %d", &n) == 1) {
+			/* The frame the game drew goes on screen at the next VBlank, so
+			   the picture is the one the frame after this one shows. */
+			printedShot = n;
+			printedShotCountdown = 2;
+			return;
+		}
+		puts(line);
 		fflush(stdout);
 		return;
 	}
@@ -306,7 +325,7 @@ int main(int argc, char** argv) {
 	bool quiet = false;
 	bool memDump = false;
 	int c;
-	while ((c = getopt(argc, argv, "n:k:s:o:p:l:w:W:S:mqh")) != -1) {
+	while ((c = getopt(argc, argv, "n:k:s:o:p:l:w:W:S:mqth")) != -1) {
 		switch (c) {
 		case 'n': framesArg = optarg; break;
 		case 'k': keysArg = optarg; break;
@@ -319,9 +338,10 @@ int main(int argc, char** argv) {
 		case 'S': saveArg = optarg; break;
 		case 'm': memDump = true; break;
 		case 'q': quiet = true; break;
+		case 't': shotOnPrint = true; break;
 		default:
 			fprintf(stderr, "usage: %s [-n frames] [-k keys] [-s shots] [-o dir] [-p prefix] "
-			                "[-l state] [-w state_out] [-W frame] [-S savefile] [-m] [-q] ROM\n", argv[0]);
+			                "[-l state] [-w state_out] [-W frame] [-S savefile] [-m] [-q] [-t] ROM\n", argv[0]);
 			return c == 'h' ? 0 : 1;
 		}
 	}
@@ -339,6 +359,9 @@ int main(int argc, char** argv) {
 	stateOutArg = opt(stateOutArg, "STATE_OUT");
 	stateOutAtArg = opt(stateOutAtArg, "STATE_OUT_AT");
 	saveArg = opt(saveArg, "SAVE");
+	if (getenv("SHOT_ON") && strcmp(getenv("SHOT_ON"), "1") == 0) {
+		shotOnPrint = true;
+	}
 	if (getenv("MEMDUMP") && strcmp(getenv("MEMDUMP"), "1") == 0) {
 		memDump = true;
 	}
@@ -426,6 +449,12 @@ int main(int argc, char** argv) {
 		}
 		core->setKeys(core, keys);
 		core->runFrame(core);
+		if (printedShotCountdown && --printedShotCountdown == 0) {
+			shoot(core, outDir, prefix, (unsigned) printedShot, quiet);
+			if (memDump) {
+				dumpMemory(core, outDir, prefix, (unsigned) printedShot);
+			}
+		}
 		if (wantShot(shots, nShots, f)) {
 			shoot(core, outDir, prefix, f, quiet);
 			if (memDump) {

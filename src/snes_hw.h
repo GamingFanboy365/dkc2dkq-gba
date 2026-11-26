@@ -23,6 +23,9 @@
 
 typedef struct {
   uint16_t vram[0x8000];
+  // A counter per 16 bytes of VRAM, bumped on every write there: a renderer
+  // that converts tiles keeps the counts it converted at to see changes.
+  uint8_t vram_ver[0x1000];
   uint16_t cgram[256];
   uint16_t oam[256];
   uint8_t high_oam[32];
