@@ -75,9 +75,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   endif()
   # The C library mustn't turn its own loops into calls to itself.
   set_source_files_properties(gba/libc.c PROPERTIES COMPILE_OPTIONS "-fno-builtin")
-  # The recompiled code: Thumb's pc-relative ranges are too short for its
-  # biggest functions; ARM it is.
-  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-marm")
+  # The recompiled code runs from ROM, whose bus is 16 bits wide: Thumb,
+  # half the fetches of ARM. One bank's biggest function is too big for
+  # Thumb's pc-relative ranges; ARM for that one.
+  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-mthumb")
+  set_source_files_properties(${GEN}/bank_B8.c PROPERTIES COMPILE_OPTIONS "-w;-marm")
   # What the recompiled code calls into, ARM too, so the memory map's inline
   # functions inline everywhere (their hot parts are in IWRAM).
   set_source_files_properties(src/snes_hw.c src/runtime.c gba/render.c PROPERTIES COMPILE_OPTIONS "-marm")
