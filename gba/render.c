@@ -272,12 +272,11 @@ static uint16_t g_fixed_line[224];
 
 // Per SNES line, what HDMA may change besides the scroll: the main and
 // sub screens' layers, color math's settings, and up to MAX_LINE_COLORS
-// CGRAM entries (CGRAM as it was before the frame's HDMA, for lines before
-// an entry's first write).
+// CGRAM entries (for lines before an entry's first write, its value then:
+// the hook sees a write before it's made).
 static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
 static uint8_t g_hdma_color[MAX_LINE_COLORS], g_num_hdma_colors;
 static uint16_t g_line_color[224][MAX_LINE_COLORS];
-static uint16_t g_cgram_before[256];
 static int g_hdma_line;
 
 static void hdma_write_hook(uint8_t reg, uint8_t value) {
@@ -289,7 +288,7 @@ static void hdma_write_hook(uint8_t reg, uint8_t value) {
   if (g_num_hdma_colors == MAX_LINE_COLORS) return;
   int k = g_num_hdma_colors++;
   g_hdma_color[k] = c;
-  for (int line = 0; line < g_hdma_line; line++) g_line_color[line][k] = g_cgram_before[c];
+  for (int line = 0; line < g_hdma_line; line++) g_line_color[line][k] = g_hw.cgram[c];
 }
 
 IWRAM_CODE static void capture_line(int line) {
@@ -595,7 +594,7 @@ void render_init(void) {
 
 uint32_t g_render_cycles, g_idle_cycles;
 
-void render_frame(void) {
+IWRAM_CODE void render_frame(void) {
   // The game may finish frames faster than the GBA shows them: wait for the
   // last one to go on screen (this also paces the game to 60 frames).
   uint32_t t0 = cycles_now();
@@ -614,7 +613,6 @@ void render_frame(void) {
   }
 
   // HDMA writes the registers line by line; note them at each line.
-  for (int i = 0; i < 256; i++) g_cgram_before[i] = g_hw.cgram[i];
   g_num_hdma_colors = 0;
   g_hdma_line = 0;
   g_ppu_write_hook = hdma_write_hook;
@@ -659,8 +657,18 @@ void render_frame(void) {
     f->bgcnt_base[b] = bgcnt_base[b];
   }
   f->per_line_regs = false;
+  uint32_t last_state = 0xffffffff;
   for (int gy = 0; gy < LINES; gy++) {
     int sy = g_src_line[gy];
+    uint32_t state = (uint32_t)g_line_tm[sy] | g_line_ts[sy] << 8 | g_line_cgwsel[sy] << 16 |
+                     (uint32_t)g_line_cgadsub[sy] << 24;
+    if (state == last_state) {
+      // As the line before: the same registers.
+      uint16_t *r = f->line_regs[gy], *q = f->line_regs[gy - 1];
+      r[0] = q[0]; r[1] = q[1]; r[2] = q[2]; r[3] = q[3];
+      continue;
+    }
+    last_state = state;
     uint8_t tm = g_line_tm[sy] & 0x17, cgadsub = g_line_cgadsub[sy], cgwsel = g_line_cgwsel[sy];
     bool math = modes01 && (cgadsub & 0x3f) && !(cgadsub & 0x80) && (cgwsel & 0x30) != 0x30;
     // The sub screen's layers: those only there are shown behind the main
