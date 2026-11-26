@@ -445,11 +445,25 @@ static int gba_entries(int c, uint16_t *out) {
   return 1;
 }
 
+// What each GBA map row last showed: (valid, SNES row, window) as drawn by
+// draw_row, so a row showing the same, whose SNES map entries no write
+// touched since (g_vram_changed), needn't be looked at again.
+EWRAM_DATA static uint16_t g_row_shown[3][32];
+EWRAM_DATA static uint32_t g_vram_changed[128];   // this frame's VRAM write bits (refresh_dirty)
+#define ROW_SHOWN(row, window) ((uint16_t)(0x8000 | (row) << 8 | (window)))
+
+// Any write to the 32 map words at w (a row's, 32-aligned)?
+static inline bool map_words_changed(uint32_t w) {
+  uint32_t c = (w & 0x7fff) >> 3;
+  return (g_vram_changed[c >> 5] >> (c & 31)) & 0xf;
+}
+
 static Pool *bg_pool(int b) { return &g_pools[b]; }
 static Pool *cell_pool(int b, int i) { return cell_hires(b, i) ? &g_pools[HIRES_POOL] : &g_pools[b]; }
 
 static void clear_cells(int b) {
   volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
+  for (int g = 0; g < 32; g++) g_row_shown[b][g] = 0;
   for (int i = 0; i < 1024; i++) {
     if (g_cell_key[b][i] != NO_CELL) release(cell_pool(b, i), map[i] & 0x3ff);
     g_cell_key[b][i] = NO_CELL;
@@ -469,6 +483,7 @@ static void evict_hidden(void) {
         if (shown && (g_row_col0[b][row] == 0xff || ((col - g_row_col0[b][row]) & 31) < 31)) continue;
         release(cell_pool(b, i), map[i] & 0x3ff);
         g_cell_key[b][i] = NO_CELL;
+        g_row_shown[b][row] = 0;
       }
     }
   }
@@ -596,12 +611,18 @@ IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
       g_visible_rows[b] |= 1u << g;
       g_row_col0[b][g] = wide ? (uint8_t)(col0 & 31) : 0xff;   // 0xff: the whole row
       uint32_t row_base = map_base + (row & 31) * 32 + ((row & 32) ? (wide ? 0x800 : 0x400) : 0);
+      uint16_t shown = ROW_SHOWN(row, window);
+      if (g_row_shown[b][g] == shown && !map_words_changed(row_base) &&
+          !(wide && map_words_changed(row_base + 0x400)))
+        goto drawn;   // as last frame
+      g_row_shown[b][g] = shown;
 #ifdef RENDER_DEBUG
       g_dbg_rows[b]++;
 #endif
       draw_row(b, row_base, col0, wide, chr, words_per_tile, pal_add, map + g * 32, g_cell_key[b] + g * 32,
                &g_cell_hires[b][g], hires ? &g_pools[HIRES_POOL] : pool, hires, need_priority);
     }
+  drawn:
     last_g = g;
     f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
     f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((g * 8 + (bgy & 7) - gy) & 0x1ff);
@@ -635,6 +656,7 @@ IWRAM_CODE static void refresh_dirty(uint32_t obj_base, uint32_t obj_gap, bool o
   uint32_t last_4bpp = 0xffffffff, last_obj = 0xffffffff;   // 4bpp tiles span two chunks
   for (uint32_t w = 0; w < 128; w++) {
     uint32_t bits = dirty[w];
+    g_vram_changed[w] = bits;
     if (!bits) continue;
     dirty[w] = 0;
     for (uint32_t k = 0; bits; k++, bits >>= 1) {
