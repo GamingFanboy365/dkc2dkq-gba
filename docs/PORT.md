@@ -64,7 +64,7 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 |---|---|---|---|
 | First build | 1,530,000 | 920,000 | 2,450,000 (8.7 frames) |
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
-| Now | 314,000 | 287,000 | 600,000 (2.1 frames) |
+| Now | 293,000 | 284,000 | 577,000 (2.05 frames) |
 
 (Measured over game frames 2340-2399 of the play session, in the level; an
 earlier "315,000 for drawing" was a quieter stretch.)

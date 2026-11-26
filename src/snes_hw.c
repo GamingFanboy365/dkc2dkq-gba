@@ -358,34 +358,57 @@ HOT_CODE static bool fast_vram_dma(const uint8_t *src, bool fixed, uint32_t size
 // OAM ($2104) and CGRAM ($2122) uploads, mode 0: the ports' own steps
 // (ppu_write), without the per-byte dispatch.
 HOT_CODE static void fast_oam_dma(const uint8_t *src, uint32_t size) {
+  if (!size) return;
+  // The port's state in locals for the run (g_hw is in the GBA's EWRAM).
+  uint8_t adr = g_hw.oam_adr, high = g_hw.oam_in_high, second = g_hw.oam_second_write, buffer = g_hw.oam_buffer;
+  uint8_t val = 0;
   for (; size; size--) {
-    uint8_t val = *src++;
-    if (g_hw.oam_in_high) {
-      g_hw.high_oam[((g_hw.oam_adr & 0xf) << 1) | g_hw.oam_second_write] = val;
-      if (g_hw.oam_second_write) {
-        g_hw.oam_adr++;
-        if (g_hw.oam_adr == 0) g_hw.oam_in_high = 0;
-      }
-    } else if (!g_hw.oam_second_write) {
-      g_hw.oam_buffer = val;
-    } else {
-      g_hw.oam[g_hw.oam_adr++] = (uint16_t)(val << 8 | g_hw.oam_buffer);
-      if (g_hw.oam_adr == 0) g_hw.oam_in_high = 1;
+    if (!high && !second && size >= 2) {
+      // A whole word of the main table
+      buffer = src[0];
+      val = src[1];
+      src += 2;
+      size--;
+      g_hw.oam[adr++] = (uint16_t)(val << 8 | buffer);
+      if (adr == 0) high = 1;
+      continue;
     }
-    g_hw.oam_second_write ^= 1;
-    g_hw.regs[0x04] = val;
+    val = *src++;
+    if (high) {
+      g_hw.high_oam[((adr & 0xf) << 1) | second] = val;
+      if (second) {
+        adr++;
+        if (adr == 0) high = 0;
+      }
+    } else if (!second) {
+      buffer = val;
+    } else {
+      g_hw.oam[adr++] = (uint16_t)(val << 8 | buffer);
+      if (adr == 0) high = 1;
+    }
+    second ^= 1;
   }
+  g_hw.oam_adr = adr;
+  g_hw.oam_in_high = high;
+  g_hw.oam_second_write = second;
+  g_hw.oam_buffer = buffer;
+  g_hw.regs[0x04] = val;
 }
 
 HOT_CODE static void fast_cgram_dma(const uint8_t *src, uint32_t size) {
-  for (; size; size--) {
-    uint8_t val = *src++;
-    if (!g_hw.cgram_second_write) g_hw.cgram_buffer = val;
-    else g_hw.cgram[g_hw.cgram_pointer++] = (uint16_t)(val << 8 | g_hw.cgram_buffer);
-    g_hw.cgram_second_write ^= 1;
-    g_hw.regs[0x22] = val;
-    g_hw.cgram_ver++;
+  if (!size) return;
+  uint8_t ptr = g_hw.cgram_pointer, second = g_hw.cgram_second_write, buffer = g_hw.cgram_buffer, val = 0;
+  for (uint32_t n = size; n; n--) {
+    val = *src++;
+    if (!second) buffer = val;
+    else g_hw.cgram[ptr++] = (uint16_t)(val << 8 | buffer);
+    second ^= 1;
   }
+  g_hw.cgram_pointer = ptr;
+  g_hw.cgram_second_write = second;
+  g_hw.cgram_buffer = buffer;
+  g_hw.regs[0x22] = val;
+  g_hw.cgram_ver = (uint16_t)(g_hw.cgram_ver + size);
 }
 
 static void do_dma(uint8_t channels) {
@@ -455,11 +478,15 @@ void hw_hdma_begin(void) {
 
 // The same as hw_hdma_begin and 224 hw_hdma_line calls, on a copy of the
 // active channels' state in fast memory (g_hw is in the GBA's EWRAM).
+bool g_hdma_wrote;
+
 HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
   hw_hdma_begin();
   struct {
     uint32_t table, indirect;
     uint8_t lines, do_transfer, active, c;
+    uint8_t mode, badr, ibank;
+    bool indirect_mode;
   } ch[8];
   int n = 0;
   for (int c = 0; c < 8; c++) {
@@ -470,17 +497,22 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
     ch[n].do_transfer = g_hw.hdma[c].do_transfer;
     ch[n].active = 1;
     ch[n].c = (uint8_t)c;
+    ch[n].mode = g_hw.dma[c][0] & 7;
+    ch[n].indirect_mode = g_hw.dma[c][0] & 0x40;
+    ch[n].badr = g_hw.dma[c][1];
+    ch[n].ibank = g_hw.dma[c][7];
     n++;
   }
   for (int line = 0; line < 224; line++) {
+    g_hdma_wrote = false;
     for (int k = 0; k < n; k++) {
       if (!ch[k].active) continue;
-      const uint8_t *r = g_hw.dma[ch[k].c];
-      bool indirect = r[0] & 0x40;
+      bool indirect = ch[k].indirect_mode;
       uint32_t bank = ch[k].table & 0xff0000;
       uint16_t t = (uint16_t)ch[k].table;
       if (ch[k].do_transfer) {
-        uint8_t mode = r[0] & 7;
+        uint8_t mode = ch[k].mode;
+        g_hdma_wrote = true;
         for (int i = 0; i < kTransferLength[mode]; i++) {
           uint8_t v;
           if (indirect) {
@@ -489,7 +521,7 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
           } else {
             v = rd8(bank | t++);
           }
-          bbus_write((uint8_t)(r[1] + kBAdrOffsets[mode][i]), v);
+          bbus_write((uint8_t)(ch[k].badr + kBAdrOffsets[mode][i]), v);
         }
       }
       ch[k].lines--;
@@ -499,7 +531,7 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
         if (indirect) {
           uint16_t ind = rd8(bank | t) | rd8(bank | (uint16_t)(t + 1)) << 8;
           t += 2;
-          ch[k].indirect = (uint32_t)r[7] << 16 | ind;
+          ch[k].indirect = (uint32_t)ch[k].ibank << 16 | ind;
         }
         if (ch[k].lines == 0) ch[k].active = 0;
         ch[k].do_transfer = 1;

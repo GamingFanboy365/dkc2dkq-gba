@@ -136,7 +136,7 @@ static int g_shown;                    // the frame on screen
 
 static uint32_t g_expand[256];          // a bitplane byte -> a bit in each pixel's nibble
 static uint8_t g_reverse8[256];
-static uint8_t g_odd4[256];             // a bitplane byte's pixels 1, 3, 5, 7 (bits 6, 4, 2, 0) -> 4 bits
+EWRAM_DATA static uint8_t g_odd4[256];             // a bitplane byte's pixels 1, 3, 5, 7 (bits 6, 4, 2, 0) -> 4 bits
 
 // The order a pool takes free slots in: segments of slots counting up
 // (step 1) or down (-1) from `first`. Each fills from its own end toward
@@ -413,10 +413,37 @@ static void mode7_line(int line, int32_t *x, int32_t *y) {
   *y = ((m[2] * ch) & ~63) + ((m[3] * ry) & ~63) + ((m[3] * cv) & ~63) + (y0 << 8);
 }
 
+static int g_last_captured;   // the last line captured this frame, or -1
+
 IWRAM_CODE static void capture_line(int line) {
+  if (!g_line_used[line]) {   // a line the view leaves out
+    if (g_hdma_wrote) {
+      if ((uint16_t)(g_hw.cgram_ver - g_cgram_ver_seen) >= 2) note_cgram_write(line);
+      g_cgram_ver_seen = g_hw.cgram_ver;
+      g_last_captured = -1;   // what it wrote isn't in the arrays
+    }
+    return;
+  }
+  int p = g_last_captured;
+  g_last_captured = line;
+  if (!g_hdma_wrote && p >= 0) {
+    // Nothing written since the last line captured: as it.
+    for (int b = 0; b < 3; b++) {
+      g_hofs[b][line] = g_hofs[b][p];
+      g_vofs[b][line] = g_vofs[b][p];
+    }
+    g_fixed_line[line] = g_fixed_line[p];
+    g_line_tm[line] = g_line_tm[p];
+    g_line_ts[line] = g_line_ts[p];
+    g_line_cgwsel[line] = g_line_cgwsel[p];
+    g_line_win[line] = g_line_win[p];
+    g_line_cgadsub[line] = g_line_cgadsub[p];
+    for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_line_color[p][k];
+    g_line_mode[line] = g_line_mode[p];
+    return;
+  }
   if ((uint16_t)(g_hw.cgram_ver - g_cgram_ver_seen) >= 2) note_cgram_write(line);
   g_cgram_ver_seen = g_hw.cgram_ver;
-  if (!g_line_used[line]) return;   // a line the view leaves out
   for (int b = 0; b < 3; b++) {
     g_hofs[b][line] = g_hw.hofs[b];
     g_vofs[b][line] = g_hw.vofs[b];
@@ -941,6 +968,7 @@ IWRAM_CODE void render_frame(void) {
   }
   g_num_hdma_colors = 0;
   g_cgram_ver_seen = g_hw.cgram_ver;
+  g_last_captured = -1;
   hw_hdma_frame(capture_line);
 
   // The mode: the middle line's.

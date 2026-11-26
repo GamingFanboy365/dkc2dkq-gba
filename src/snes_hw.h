@@ -85,6 +85,8 @@ void hw_hdma_line(void);
 // The same for a whole frame: begin, then the 224 lines, calling
 // after_line(line) after each line's transfers (NULL: none).
 void hw_hdma_frame(void (*after_line)(int line));
+// In hw_hdma_frame's after_line: whether HDMA wrote anything on that line.
+extern bool g_hdma_wrote;
 extern void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
 // The start of VBlank: the NMI flag, and the joypads read (auto-joypad).
 void hw_vblank(uint16_t joy1);
