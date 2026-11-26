@@ -43,11 +43,15 @@ code or a cartridge.
   tiles in front of BG1 (the lights on the world map's sign), color math
   that adds the sub screen to two layers at once (the mist over the
   island), subtracting, HDMA changing Mode 7's matrix.
-- **Known weak spot**: where no trace has run the code, the recompiler
-  keeps the disassembly's instruction boundaries, and the disassembly
-  decodes some bytes at the wrong register width (as at $B5F74B, where
-  the native version does what the SNES does). Such code is wrong until a
-  trace covers it.
+- **Widths no trace saw**: where no trace has run the code, the
+  recompiler takes instruction boundaries from the disassembly, which
+  decodes some bytes at the wrong register width. Where the width analysis
+  proves another width (all of an immediate's predecessors agree), it
+  re-decodes from the ROM: one spot in the whole game ($B5F74C, which the
+  native version of its routine also does right). Where the analysis can't
+  tell, the generated code tests the width at run time, but the
+  instruction boundaries are still the disassembly's: a trace that runs
+  more of the game would settle those too.
 - **Not yet**: sound (the sound CPU only answers handshakes); saves; only
   the first level is verified (code the traces haven't seen run may have
   entries or register widths the recompiler doesn't know).

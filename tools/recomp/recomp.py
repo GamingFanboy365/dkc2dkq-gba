@@ -58,7 +58,7 @@ def canonical(addr):
 
 class Insn:
     __slots__ = ("addr", "op", "mnem", "mode", "length", "operand", "marker", "file", "line",
-                 "m_in", "x_in", "assumed", "region")
+                 "m_in", "x_in", "assumed", "region", "m_pred", "x_pred")
 
     def __init__(self, addr, op, mnem, mode, file, line, marker):
         self.addr, self.op, self.mnem, self.mode = addr, op, mnem, mode
@@ -66,6 +66,7 @@ class Insn:
         self.length = 1 + OPERAND_SIZE[mode]
         self.operand = 0
         self.m_in = self.x_in = 0
+        self.m_pred = self.x_pred = 0   # the widths its predecessors give it
         self.assumed = False
         self.region = None
 
@@ -202,6 +203,54 @@ def resync(insns, rom, tflags):
     return fixed
 
 
+def width_conflicts(insns, tflags):
+    """Immediates no trace ran whose length, from the disassembly, says
+    another width than the analysis carried to them from all their
+    predecessors (the disassembly decoded those bytes at the wrong width,
+    and nothing has shown it): [(address, m, x)], the widths to decode by."""
+    out = []
+    for a, i in sorted(insns.items()):
+        if a in tflags:
+            continue
+        if i.mode == "immm" and i.m_pred in (W8, W16) and i.m_pred != (W8 if i.length == 2 else W16):
+            out.append((a, i.m_pred, i.x_pred))
+        elif i.mode == "immx" and i.x_pred in (W8, W16) and i.x_pred != (W8 if i.length == 2 else W16):
+            out.append((a, i.m_pred, i.x_pred))
+    return out
+
+
+def redecode(insns, rom, a, m, x):
+    """Decodes the bytes from a with widths m, x (carried by REP/SEP),
+    replacing the disassembly's instructions there, until an instruction
+    ends where one of the disassembly's begins. Returns the addresses."""
+    template = insns[a]
+    fixed = []
+    while True:
+        op = rom[rom_offset(a)]
+        mnem, mode = OPCODES[op]
+        i = Insn(a, op, mnem, mode, template.file, template.line, "|")
+        if mode == "immm":
+            if m not in (W8, W16):
+                break
+            i.length = 2 if m == W8 else 3
+        if mode == "immx":
+            if x not in (W8, W16):
+                break
+            i.length = 2 if x == W8 else 3
+        off = rom_offset(a)
+        i.operand = int.from_bytes(rom[off + 1:off + i.length], "little")
+        for s in [s for s in insns if a <= s < a + i.length]:
+            del insns[s]
+        insns[a] = i
+        fixed.append(a)
+        m, x = transfer(i, m, x)
+        nxt = a + i.length
+        if mnem in NO_FALLTHROUGH or nxt in insns:
+            break
+        a = nxt
+    return fixed
+
+
 def rel_target(i):
     if i.mode == "rel":
         d = i.operand - 0x100 if i.operand & 0x80 else i.operand
@@ -279,6 +328,7 @@ def infer_widths(insns, tflags, dyn):
         # The trace decides where the analysis can't; where they disagree, both.
         m = tm if (m == WANY and tm) else (m | tm)
         x = tx if (x == WANY and tx) else (x | tx)
+        i.m_pred, i.x_pred = m, x
         if i.mode == "immm":
             m = W8 if i.length == 2 else W16
         if i.mode == "immx":
@@ -768,6 +818,20 @@ def main():
               + " ".join(f"{t:06X}" for t in missing[:20]), file=sys.stderr)
 
     infer_widths(insns, tflags, dyn)
+    for _ in range(8):
+        conflicts = width_conflicts(insns, tflags)
+        if not conflicts:
+            break
+        redone = []
+        for a, m, x in conflicts:
+            if a in insns:
+                redone += redecode(insns, rom, a, m, x)
+        print("re-decoded at the widths the analysis gives (the disassembly has other ones, no trace "
+              "ran them): " + " ".join(f"{a:06X}" for a in redone[:20]), file=sys.stderr)
+        for i in insns.values():
+            i.m_in = i.x_in = i.m_pred = i.x_pred = 0
+            i.assumed = False
+        infer_widths(insns, tflags, dyn)
     regions = make_regions(insns)
 
     labels_by_addr = collections.defaultdict(list)
