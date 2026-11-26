@@ -430,7 +430,7 @@ def hx(v, n=4):
 # Addressing modes whose address is a constant when D (DB) is: the
 # instruction is emitted twice, for the value the trace saw and for any other.
 DP_CONST_MODES = {"dp", "dpi", "dpiy", "dpil", "dpily"}
-DB_CONST_MODES = {"abs", "dpi", "dpiy"}
+DB_CONST_MODES = {"abs", "absx", "absy", "dpi", "dpiy"}
 
 
 def const_cases(i):
@@ -454,6 +454,20 @@ def ea_expr(i):
     if "DB" in CONSTS:
         e = e.replace("DBA(", f"KDB({hx(CONSTS['DB'], 2)}, ")
     return e
+
+
+def lx_parts(i):
+    """(base, index) of an indexed absolute or long access, for rd*_lx and
+    wr*_lx (src/cpu65.h); None for other modes."""
+    o, m = i.operand, i.mode
+    if m in ("absx", "absy"):
+        base = f"DBA({hx(o)})"
+        if "DB" in CONSTS:
+            base = f"KDB({hx(CONSTS['DB'], 2)}, {hx(o)})"
+        return base, "X" if m == "absx" else "Y"
+    if m == "abslx":
+        return hx(o, 6), "X"
+    return None
 
 
 def ea_expr_generic(i):
@@ -488,6 +502,9 @@ def emit_op(i, w):
     u = f"uint{w}_t" if w else None
     nz = f"NZ{w}" if w else None
     val = hx(i.operand, 4 if w == 16 else 2) if imm else (f"{rd}({ea_expr(i)})" if w and mode not in ("imp", "acc") else None)
+    lx = lx_parts(i) if w else None
+    if lx and not imm:
+        val = f"rd{w}_lx({lx[0]}, {lx[1]})"
     lo = "(uint8_t)A"
 
     def set_a(expr):  # A's low byte or all of it
@@ -500,6 +517,8 @@ def emit_op(i, w):
         return [f"{{ {u} t = {val}; {r} = t; {nz}(t); }}"]
     if mn in ("STA", "STX", "STY", "STZ"):
         src = {"STA": "A", "STX": "X", "STY": "Y", "STZ": "0"}[mn]
+        if lx:
+            return [f"wr{w}_lx({lx[0]}, {lx[1]}, ({u}){src});"]
         return [f"{wr}({ea_expr(i)}, ({u}){src});"]
     if mn in ("ORA", "AND", "EOR"):
         c = {"ORA": "|", "AND": "&", "EOR": "^"}[mn]
@@ -601,10 +620,8 @@ def emit_op(i, w):
                 "X &= 0xff; Y &= 0xff; cpu.s = 0x100 | (cpu.s & 0xff); } }"]
     if mn in ("MVN", "MVP"):
         dst, src = i.operand & 0xFF, i.operand >> 8
-        step = "+ 1" if mn == "MVN" else "- 1"
-        return [f"DB = {hx(dst, 2)}; do {{ wr8({hx(dst, 2)}0000 | Y, rd8({hx(src, 2)}0000 | X)); "
-                f"X = (uint16_t)(X {step}); Y = (uint16_t)(Y {step}); if (cpu.xf) {{ X &= 0xff; Y &= 0xff; }} "
-                f"}} while (A-- != 0);"]
+        step = "1" if mn == "MVN" else "-1"
+        return [f"DB = {hx(dst, 2)}; block_move({hx(dst, 2)}, {hx(src, 2)}, {step}, &A, &X, &Y);"]
     raise ValueError(f"no emitter for {mn} {mode} at {i.addr:06X}")
 
 

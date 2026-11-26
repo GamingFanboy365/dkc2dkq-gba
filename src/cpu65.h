@@ -53,6 +53,52 @@ static inline __attribute__((always_inline)) uint16_t rd16(uint32_t a) {
 #endif
   return rd8(a) | rd8((a + 1) & 0xffffff) << 8;
 }
+// MVN/MVP: A + 1 bytes from bank src at X to bank dst at Y, stepping by
+// step (MVN +1, MVP -1), a byte at a time as on the SNES (an overlapping
+// copy repeats a pattern as it does there). By pointers when both runs are
+// in WRAM or ROM and don't wrap; else through the memory map.
+#ifdef WRAM_DIRECT
+static inline uint8_t *block_ptr(uint8_t bank, uint32_t lo, uint32_t n, bool write) {
+  if ((bank & 0xfe) == 0x7e) return g_wram + ((uint32_t)(bank & 1) << 16) + lo;
+  if (!(bank & 0x40)) {
+    if (lo + n <= 0x2000) return g_wram + lo;
+    if (!write && lo >= 0x8000) return (uint8_t *)g_rom + ((uint32_t)(bank & 0x3f) << 16 | lo);
+    return 0;
+  }
+  return write ? 0 : (uint8_t *)g_rom + ((uint32_t)(bank & 0x3f) << 16 | lo);
+}
+#endif
+static inline __attribute__((always_inline)) void block_move(uint8_t dst, uint8_t src, int step, uint16_t *pa,
+                                                             uint16_t *px, uint16_t *py) {
+#ifdef WRAM_DIRECT
+  if (!cpu.xf) {
+    uint32_t n = (uint32_t)*pa + 1, x = *px, y = *py;
+    bool fits = step > 0 ? (x + n <= 0x10000 && y + n <= 0x10000) : (x + 1 >= n && y + 1 >= n);
+    if (fits) {
+      uint32_t x0 = step > 0 ? x : x + 1 - n, y0 = step > 0 ? y : y + 1 - n;
+      uint8_t *d = block_ptr(dst, y0, n, true);
+      const uint8_t *sp = block_ptr(src, x0, n, false);
+      if (d && sp) {
+        if (step > 0) {
+          for (uint32_t k = 0; k < n; k++) d[k] = sp[k];
+        } else {
+          for (uint32_t k = n; k-- > 0;) d[k] = sp[k];
+        }
+        *px = (uint16_t)(x + (step > 0 ? n : -n));
+        *py = (uint16_t)(y + (step > 0 ? n : -n));
+        *pa = 0xffff;
+        return;
+      }
+    }
+  }
+#endif
+  do {
+    wr8((uint32_t)dst << 16 | *py, rd8((uint32_t)src << 16 | *px));
+    *px = (uint16_t)(*px + step);
+    *py = (uint16_t)(*py + step);
+    if (cpu.xf) { *px &= 0xff; *py &= 0xff; }
+  } while ((*pa)-- != 0);
+}
 static inline uint32_t rd24(uint32_t a) {
   return rd8(a) | rd8((a + 1) & 0xffffff) << 8 | (uint32_t)rd8((a + 2) & 0xffffff) << 16;
 }
@@ -66,6 +112,49 @@ static inline __attribute__((always_inline)) void wr16(uint32_t a, uint16_t v) {
   wr8(a, (uint8_t)v);
   wr8((a + 1) & 0xffffff, v >> 8);
 }
+// base + index, base usually a constant (long,X; absolute,X/Y with DB
+// known): its bank's tests fold when compiling, leaving the index's range
+// to test before a direct WRAM or ROM access.
+static inline __attribute__((always_inline)) uint8_t rd8_lx(uint32_t l, uint16_t x) {
+#ifdef WRAM_DIRECT
+  uint32_t lo = (l & 0xffff) + x;
+  if ((l >> 17) == 0x3f) { if (lo < 0x10000) return g_wram[(l & 0x10000) | lo]; }
+  else if (!(l & 0x400000)) {
+    if (lo < 0x2000) return g_wram[lo];
+    if (lo >= 0x8000 && lo < 0x10000) return g_rom[(l >> 16 & 0x3f) << 16 | lo];
+  } else if (lo < 0x10000) return g_rom[(l >> 16 & 0x3f) << 16 | lo];
+#endif
+  return rd8((l + x) & 0xffffff);
+}
+static inline __attribute__((always_inline)) uint16_t rd16_lx(uint32_t l, uint16_t x) {
+#ifdef WRAM_DIRECT
+  uint32_t lo = (l & 0xffff) + x;
+  if ((l >> 17) == 0x3f) {
+    if (lo < 0xffff) { const uint8_t *p = g_wram + ((l & 0x10000) | lo); return p[0] | p[1] << 8; }
+  } else if (!(l & 0x400000)) {
+    if (lo < 0x1fff) return g_wram[lo] | g_wram[lo + 1] << 8;
+    if (lo >= 0x8000 && lo < 0xffff) { const uint8_t *p = g_rom + ((l >> 16 & 0x3f) << 16 | lo); return p[0] | p[1] << 8; }
+  } else if (lo < 0xffff) { const uint8_t *p = g_rom + ((l >> 16 & 0x3f) << 16 | lo); return p[0] | p[1] << 8; }
+#endif
+  return rd16((l + x) & 0xffffff);
+}
+static inline __attribute__((always_inline)) void wr8_lx(uint32_t l, uint16_t x, uint8_t v) {
+#ifdef WRAM_DIRECT
+  uint32_t lo = (l & 0xffff) + x;
+  if ((l >> 17) == 0x3f) { if (lo < 0x10000) { g_wram[(l & 0x10000) | lo] = v; return; } }
+  else if (!(l & 0x400000) && lo < 0x2000) { g_wram[lo] = v; return; }
+#endif
+  wr8((l + x) & 0xffffff, v);
+}
+static inline __attribute__((always_inline)) void wr16_lx(uint32_t l, uint16_t x, uint16_t v) {
+#ifdef WRAM_DIRECT
+  uint32_t lo = (l & 0xffff) + x;
+  if ((l >> 17) == 0x3f) {
+    if (lo < 0xffff) { uint8_t *p = g_wram + ((l & 0x10000) | lo); p[0] = (uint8_t)v; p[1] = v >> 8; return; }
+  } else if (!(l & 0x400000) && lo < 0x1fff) { g_wram[lo] = (uint8_t)v; g_wram[lo + 1] = v >> 8; return; }
+#endif
+  wr16((l + x) & 0xffffff, v);
+}
 // Bank 0's 16-bit accesses wrap within it. At an even address known when
 // compiling, in WRAM, where the platform keeps WRAM itself (WRAM_DIRECT):
 // one halfword access.
@@ -73,11 +162,17 @@ static inline __attribute__((always_inline)) uint16_t rd16_b0(uint16_t a) {
 #ifdef WRAM_DIRECT
   if (__builtin_constant_p(a) && !(a & 1) && a < 0x2000) return *(const uint16_t *)(g_wram + a);
 #endif
+#ifdef WRAM_DIRECT
+  if (a < 0x1fff) return g_wram[a] | g_wram[a + 1] << 8;
+#endif
   return rd8_b0(a) | rd8_b0((uint16_t)(a + 1)) << 8;
 }
 static inline __attribute__((always_inline)) void wr16_b0(uint16_t a, uint16_t v) {
 #ifdef WRAM_DIRECT
   if (__builtin_constant_p(a) && !(a & 1) && a < 0x2000) { *(uint16_t *)(g_wram + a) = v; return; }
+#endif
+#ifdef WRAM_DIRECT
+  if (a < 0x1fff) { g_wram[a] = (uint8_t)v; g_wram[a + 1] = v >> 8; return; }
 #endif
   wr8_b0(a, (uint8_t)v);
   wr8_b0((uint16_t)(a + 1), v >> 8);
