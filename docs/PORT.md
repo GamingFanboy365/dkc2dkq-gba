@@ -29,12 +29,20 @@ code or a cartridge.
   with runs, jumps, rolls, team-ups, swaps, pauses, deaths, the cabin, the
   map again and back in). The GBA's states match too, as far as checked.
 - **The picture**: `gba/render.c` draws the game with the GBA's video
-  hardware (see its top comment). Against the SNES's own picture of the
-  same frames (240x160 of it): the file select and the cabin are
-  pixel-exact, Pirate Panic within 0.1% of its pixels (sky gradient, ropes in
-  front, sprites). Not right yet: the Rareware logo (Mode 7), the world map
-  (it changes layers and colors line by line) and a few frames; the window
-  is fixed rather than following the Kong.
+  hardware (see its top comment). The SNES's 256x224 picture on the GBA's
+  240x160: on the title, menus and maps all 224 lines, squeezed (a GBA line
+  shows every 1.4th SNES line); in the levels 184 of them, about as wide for
+  their height as a TV shows the SNES's, the window following the Kong
+  (`gba/main.c`). Columns 8-247 either way. Sprites are made each frame of
+  the same lines as the backgrounds (no seams where pieces meet), less the
+  pixels BG1's and BG2's priority tiles cover. Modes 1, 3 (8bpp), 5 (its
+  lines under Nintendo Presents) and 7 (the GBA's affine BG); the main and
+  sub screens, color math (adding), the color window, and what HDMA changes
+  line by line (scroll, layers, color math, a couple of colors, the mode)
+  through HBlank DMA and an HBlank interrupt. Not right yet: BG2's priority
+  tiles in front of BG1 (the lights on the world map's sign), color math
+  that adds the sub screen to two layers at once (the mist over the
+  island), subtracting, HDMA changing Mode 7's matrix.
 - **Not yet**: sound (the sound CPU only answers handshakes); saves; only
   the first level is verified (code the traces haven't seen run may have
   entries or register widths the recompiler doesn't know).
@@ -46,16 +54,22 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 | | Logic | Drawing | Together |
 |---|---|---|---|
 | First build | 1,530,000 | 920,000 | 2,450,000 (8.7 frames) |
-| Now | 575,000 | 315,000 | 890,000 (3.2 frames) |
+| Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
+| Now | 555,000 | 385,000 | 940,000 (3.3 frames) |
+
+(Measured over game frames 2340-2399 of the play session, in the level; an
+earlier "315,000 for drawing" was a quieter stretch.)
 
 What did it, measured with gbarun's sampling profiler (`PROFILE=`,
 `tools/profile_report.py`): the memory map inline, DMA to VRAM/OAM/CGRAM as
 copy loops, calls that return normally kept native, routines merged into
 bigger functions, a page index for the dispatcher, no cycle counting on the
 GBA; in the renderer, map cells and tile slots rewritten only when what they
-show changes, VRAM's dirty bits, hot loops as ARM in IWRAM. What's left is
-spread out: HDMA (~10%), the game's own decompression and object code, the
-map and sprite loops.
+show changes, VRAM's dirty bits, hot loops as ARM in IWRAM, a 32-column
+map's row drawn once whatever each line's scroll, HDMA run on a copy of
+its state in IWRAM. What's left: the game's own logic (the recompiled code:
+about 60%), the map rows, HDMA. IWRAM (32 KB) and EWRAM (256 KB, half of
+it the SNES's WRAM) are nearly full.
 
 ## Building and checking
 
