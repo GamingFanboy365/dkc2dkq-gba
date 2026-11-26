@@ -39,6 +39,13 @@ static uint16_t serial_order(uint16_t joy) {
 
 void hw_vblank(uint16_t joy1) {
   g_hw.in_nmi = 1;
+  if (!(g_hw.regs[0x00] & 0x80)) {
+    // Unless the screen is blanked, the OAM address goes back to the one
+    // last written: the game's OAM DMA counts on it.
+    g_hw.oam_adr = g_hw.oam_adr_written;
+    g_hw.oam_in_high = g_hw.oam_in_high_written;
+    g_hw.oam_second_write = 0;
+  }
   g_hw.joy1_now = joy1;
   if (g_hw.nmitimen & 1) {
     // Auto-joypad: latch, shift 16 bits out of each port (ones shift in).
@@ -67,9 +74,28 @@ static uint16_t vram_remap(void) {
   }
 }
 
+void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
+
 static void ppu_write(uint8_t adr, uint8_t val) {
   g_hw.regs[adr] = val;
+  if (g_ppu_write_hook) g_ppu_write_hook(adr, val);
   switch (adr) {
+    case 0x0d: case 0x0f: case 0x11: case 0x13:
+      g_hw.hofs[(adr - 0x0d) >> 1] =
+          (uint16_t)((val << 8 | (g_hw.scroll_prev & 0xf8) | (g_hw.scroll_prev2 & 7)) & 0x3ff);
+      g_hw.scroll_prev = g_hw.scroll_prev2 = val;
+      if (adr == 0x0d) g_hw.m7prev = val;
+      break;
+    case 0x0e: case 0x10: case 0x12: case 0x14:
+      g_hw.vofs[(adr - 0x0e) >> 1] = (uint16_t)((val << 8 | g_hw.scroll_prev) & 0x3ff);
+      g_hw.scroll_prev = val;
+      if (adr == 0x0e) g_hw.m7prev = val;
+      break;
+    case 0x32:
+      if (val & 0x80) g_hw.fixed_b = val & 0x1f;
+      if (val & 0x40) g_hw.fixed_g = val & 0x1f;
+      if (val & 0x20) g_hw.fixed_r = val & 0x1f;
+      break;
     case 0x02:
       g_hw.oam_adr = g_hw.oam_adr_written = val;
       g_hw.oam_in_high = g_hw.oam_in_high_written;
@@ -289,6 +315,66 @@ static void do_dma(uint8_t channels) {
     r[2] = (uint8_t)a_adr;
     r[3] = a_adr >> 8;
     r[5] = r[6] = 0;
+  }
+}
+
+// ---- HDMA ----
+
+static const uint8_t kTransferLength[8] = {1, 2, 2, 4, 4, 4, 2, 4};
+
+void hw_hdma_begin(void) {
+  for (int c = 0; c < 8; c++) {
+    const uint8_t *r = g_hw.dma[c];
+    g_hw.hdma[c].active = (g_hw.hdmaen >> c) & 1;
+    g_hw.hdma[c].do_transfer = 0;
+    if (!g_hw.hdma[c].active) continue;
+    uint32_t bank = (uint32_t)r[4] << 16;
+    uint16_t t = r[2] | r[3] << 8;
+    g_hw.hdma[c].lines = rd8(bank | t++);
+    if (g_hw.hdma[c].lines == 0) g_hw.hdma[c].active = 0;
+    if (r[0] & 0x40) {
+      uint16_t ind = rd8(bank | t) | rd8(bank | (uint16_t)(t + 1)) << 8;
+      t += 2;
+      g_hw.hdma[c].indirect = (uint32_t)r[7] << 16 | ind;
+    }
+    g_hw.hdma[c].table = bank | t;
+    g_hw.hdma[c].do_transfer = 1;
+  }
+}
+
+void hw_hdma_line(void) {
+  for (int c = 0; c < 8; c++) {
+    if (!g_hw.hdma[c].active) continue;
+    const uint8_t *r = g_hw.dma[c];
+    bool indirect = r[0] & 0x40;
+    uint32_t bank = g_hw.hdma[c].table & 0xff0000;
+    uint16_t t = (uint16_t)g_hw.hdma[c].table;
+    if (g_hw.hdma[c].do_transfer) {
+      uint8_t mode = r[0] & 7;
+      for (int i = 0; i < kTransferLength[mode]; i++) {
+        uint8_t v;
+        if (indirect) {
+          v = rd8(g_hw.hdma[c].indirect);
+          g_hw.hdma[c].indirect = (g_hw.hdma[c].indirect & 0xff0000) | (uint16_t)(g_hw.hdma[c].indirect + 1);
+        } else {
+          v = rd8(bank | t++);
+        }
+        bbus_write((uint8_t)(r[1] + kBAdrOffsets[mode][i]), v);
+      }
+    }
+    g_hw.hdma[c].lines--;
+    g_hw.hdma[c].do_transfer = g_hw.hdma[c].lines >> 7;
+    if ((g_hw.hdma[c].lines & 0x7f) == 0) {
+      g_hw.hdma[c].lines = rd8(bank | t++);
+      if (indirect) {
+        uint16_t ind = rd8(bank | t) | rd8(bank | (uint16_t)(t + 1)) << 8;
+        t += 2;
+        g_hw.hdma[c].indirect = (uint32_t)r[7] << 16 | ind;
+      }
+      if (g_hw.hdma[c].lines == 0) g_hw.hdma[c].active = 0;
+      g_hw.hdma[c].do_transfer = 1;
+    }
+    g_hw.hdma[c].table = bank | t;
   }
 }
 

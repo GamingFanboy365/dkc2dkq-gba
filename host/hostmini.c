@@ -3,22 +3,95 @@
 // reference: the same SYNC log as snesrun and hostrun.
 //
 //   hostmini ROM   (FRAMES, KEYS, SYNC as snesrun; DUMPS writes WRAM, VRAM,
-//                   CGRAM at the given frames' waits, OUT=DIR)
+//                   CGRAM at the given frames' waits, OUT=DIR; REGS=N,..
+//                   prints the PPU's registers and HDMA setup at the game's
+//                   Nth waits; SHOTS=N,.. saves the picture a SNES would show
+//                   from the model's state at the game's Nth waits
+//                   (mini_shot_N.png): LakeSnes's PPU, given the model's
+//                   VRAM, CGRAM, OAM and registers, with the model's HDMA
+//                   run line by line)
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../tools/common/tool_common.h"
 #include "cpu65.h"
 #include "game_loop.h"
 #include "snes_hw.h"
+#include "../third_party/lakesnes/snes.h"
 #include "sync_hash.h"
 
 static int g_frame, g_num_waits;
 static KeyScript g_keys;
 static FILE *g_sync;
 static int g_dumps[4096], g_num_dumps;
+static int g_regdumps[4096], g_num_regdumps;   // REGS=N,..: print the PPU's registers at these waits
 static const char *g_out = ".";
 
+
+// ---- the SNES's picture of the model's state ----
+
+static Snes *g_ref;
+static int g_shots[4096], g_num_shots;
+
+static void ref_write(uint8_t reg, uint8_t value) { ppu_write(g_ref->ppu, reg, value); }
+
+static void ref_load_state(void) {
+  Ppu *ppu = g_ref->ppu;
+  ppu_reset(ppu);
+  memcpy(ppu->vram, g_hw.vram, sizeof(ppu->vram));
+  memcpy(ppu->cgram, g_hw.cgram, sizeof(ppu->cgram));
+  memcpy(ppu->oam, g_hw.oam, sizeof(ppu->oam));
+  memcpy(ppu->highOam, g_hw.high_oam, sizeof(ppu->highOam));
+  for (int r = 0; r < 0x34; r++) {
+    if ((r >= 0x02 && r <= 0x04) || (r >= 0x0d && r <= 0x22) || r == 0x32) continue;
+    ppu_write(ppu, (uint8_t)r, g_hw.regs[r]);
+  }
+  for (int i = 0; i < 4; i++) {
+    ppu_write(ppu, (uint8_t)(0x0d + i * 2), (uint8_t)g_hw.hofs[i]);
+    ppu_write(ppu, (uint8_t)(0x0d + i * 2), g_hw.hofs[i] >> 8);
+    ppu_write(ppu, (uint8_t)(0x0e + i * 2), (uint8_t)g_hw.vofs[i]);
+    ppu_write(ppu, (uint8_t)(0x0e + i * 2), g_hw.vofs[i] >> 8);
+  }
+  ppu_write(ppu, 0x1a, g_hw.regs[0x1a]);
+  ppu_write(ppu, 0x32, 0x20 | g_hw.fixed_r);
+  ppu_write(ppu, 0x32, 0x40 | g_hw.fixed_g);
+  ppu_write(ppu, 0x32, 0x80 | g_hw.fixed_b);
+  // The scroll latches as the model has them, for HDMA's scroll writes.
+  ppu->scrollPrev = g_hw.scroll_prev;
+  ppu->scrollPrev2 = g_hw.scroll_prev2;
+}
+
+// Runs the frame's HDMA on the model, and draws the frame if asked.
+static void run_display(bool draw) {
+  if (draw) {
+    if (!g_ref) g_ref = snes_init();
+    ref_load_state();
+    g_ppu_write_hook = ref_write;
+    ppu_handleFrameStart(g_ref->ppu);
+  }
+  hw_hdma_begin();
+  for (int line = 0; line < 224; line++) {
+    hw_hdma_line();
+    if (draw) ppu_runLine(g_ref->ppu, line + 1);
+  }
+  g_ppu_write_hook = NULL;
+  if (draw) {
+    static uint8_t pixels[512 * 480 * 4];
+    static uint8_t rgb[256 * 224 * 3];
+    ppu_handleVblank(g_ref->ppu);
+    ppu_putPixels(g_ref->ppu, pixels);
+    for (int y = 0; y < 224; y++)
+      for (int x = 0; x < 256; x++) {
+        const uint8_t *px = pixels + ((y * 2 + 16) * 512 + x * 2) * 4;
+        uint8_t *o = rgb + (y * 256 + x) * 3;
+        o[0] = px[3]; o[1] = px[2]; o[2] = px[1];
+      }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/mini_shot_%d.png", g_out, g_num_waits);
+    write_png_rgb(path, rgb, 256, 224);
+  }
+}
 
 uint16_t on_wait(uint32_t wai_pc) {
   if (g_sync) fprintf(g_sync, "%d %08x %06x\n", g_frame, sync_hash(g_wram), wai_pc);
@@ -31,6 +104,20 @@ uint16_t on_wait(uint32_t wai_pc) {
     snprintf(path, sizeof(path), "%s/mini_cgram_%05d.bin", g_out, g_frame);
     write_file(path, g_hw.cgram, sizeof(g_hw.cgram));
   }
+  if (int_list_has(g_regdumps, g_num_regdumps, g_num_waits)) {
+    printf("wait %d (frame %d): PPU", g_num_waits, g_frame);
+    for (int i = 0; i < 0x34; i++) printf("%s%02x", i % 16 == 0 ? "\n  " : " ", g_hw.regs[i]);
+    printf("\n  NMITIMEN %02x HDMAEN %02x\n", g_hw.nmitimen, g_hw.hdmaen);
+    for (int c = 0; c < 8; c++)
+      if (g_hw.hdmaen & (1 << c)) {
+        const uint8_t *d = g_hw.dma[c];
+        uint32_t table = d[4] << 16 | d[3] << 8 | d[2];
+        printf("  HDMA %d: mode %02x -> $21%02x, table %06x, indirect bank %02x:", c, d[0], d[1], table, d[7]);
+        for (int i = 0; i < 12; i++) printf(" %02x", rd8(table + i));
+        printf("\n");
+      }
+  }
+  run_display(int_list_has(g_shots, g_num_shots, g_num_waits));
   return keyscript_at(&g_keys, g_num_waits++);
 }
 
@@ -58,6 +145,8 @@ int main(int argc, char **argv) {
   if (getenv("SYNC")) g_sync = fopen(getenv("SYNC"), "w");
   if (getenv("OUT")) g_out = getenv("OUT");
   g_num_dumps = parse_int_list(getenv("DUMPS"), g_dumps, 4096);
+  g_num_regdumps = parse_int_list(getenv("REGS"), g_regdumps, 4096);
+  g_num_shots = parse_int_list(getenv("SHOTS"), g_shots, 4096);
   game_reset();
   for (g_frame = 0; g_frame < frames; g_frame++) {
     if (!game_frame()) {

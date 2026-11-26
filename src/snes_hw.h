@@ -3,8 +3,12 @@
 // joypads and the APU's ports. It's what the GBA build runs on, and the PC's
 // `hostmini` checks it against the reference.
 //
-// What it leaves out, for now: HDMA and the PPU's other registers are only
-// recorded (regs[]) for a renderer to use; the APU runs no code: its port 0
+// The PPU draws nothing here: its registers are recorded (regs[], and
+// decoded where a register takes two writes) for a renderer. HDMA is run a
+// frame at a time by the platform: hw_hdma_begin, then hw_hdma_line before
+// each visible line, which writes that line's registers as the SNES would.
+//
+// What it leaves out, for now: the APU runs no code: its port 0
 // answers as the IPL ROM does while the game uploads the sound driver (the
 // $CC start, an echo of the counter per byte, the jump), reads 0 once the
 // driver starts, and then echoes what the CPU writes, which is all the game's
@@ -30,6 +34,17 @@ typedef struct {
   uint8_t cgram_pointer, cgram_second_write, cgram_buffer;
   int16_t m7matrix[2];
   uint8_t m7prev;
+  // Decoded registers (the write-twice ones, and COLDATA's three channels)
+  uint16_t hofs[4], vofs[4];
+  uint8_t scroll_prev, scroll_prev2;
+  uint8_t fixed_r, fixed_g, fixed_b;
+  // HDMA, while a frame's lines are run (hw_hdma_*)
+  struct {
+    uint32_t table;           // the next table byte to read
+    uint32_t indirect;        // indirect mode: the next data byte
+    uint8_t lines;            // the line counter (bit 7: repeat)
+    uint8_t active, do_transfer;
+  } hdma[8];
   // CPU registers
   uint8_t nmitimen, hdmaen, in_nmi;
   uint8_t multiply_a;
@@ -53,6 +68,12 @@ extern const uint8_t *g_rom;
 extern uint32_t g_rom_mask;   // ROM size - 1 (a power of two)
 
 void hw_reset(void);
+// HDMA for one frame: begin at the top, then a call per visible line (0 to
+// 223) in order, before the line is drawn. Every PPU register write, the
+// game's and HDMA's, goes to g_ppu_write_hook too when it's set.
+void hw_hdma_begin(void);
+void hw_hdma_line(void);
+extern void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
 // The start of VBlank: the NMI flag, and the joypads read (auto-joypad).
 void hw_vblank(uint16_t joy1);
 static inline bool hw_nmi_enabled(void) { return g_hw.nmitimen & 0x80; }
