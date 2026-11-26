@@ -48,6 +48,9 @@ if(DKC2_ROM)
             --probe-cache ${CMAKE_BINARY_DIR}/probe.json ${TRACE_ARGS}
     DEPENDS ${RECOMP} ${ASM} ${TRACES}
     COMMENT "Recompiling the game's code from the ROM")
+  # Native versions of some routines (their recompiled code's names): built
+  # as the recompiled code is.
+  list(APPEND GEN_SOURCES ${CMAKE_SOURCE_DIR}/src/native.c)
   set(PORT_SOURCES src/runtime.c src/snes_hw.c src/game_loop.c)
 endif()
 
