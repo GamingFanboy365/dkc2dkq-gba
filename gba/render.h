@@ -5,11 +5,11 @@
 #include <stdint.h>
 
 void render_init(void);
-// What part of the SNES's 256x224 picture the 240x160 screen shows:
-// RENDER_CROP, a window of it at full size; RENDER_FIT, all its lines,
-// squeezed (columns 8-247 either way).
+// What part of the SNES's 256x224 picture the 240x160 screen shows, from
+// the next frame drawn: RENDER_CROP, lines crop_y to crop_y + 159 at full
+// size; RENDER_FIT, all its lines, squeezed (columns 8-247 either way).
 enum { RENDER_CROP, RENDER_FIT };
-void render_set_view(int view);
+void render_set_view(int view, int crop_y);
 // Draws the frame the hardware model shows now (after a frame of the
 // game's logic), to be put on screen at the next VBlank. Waits if the last
 // one isn't on screen yet.

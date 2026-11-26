@@ -36,7 +36,45 @@ void irq_handler(void) {
 #endif
 static int g_waits;
 
+// The view (render.h): the SNES's whole picture, squeezed, except in the
+// levels, where the GBA shows 160 of its 224 lines at full size, as the
+// handheld versions of these games do: lines that keep the Kong in a band in
+// the middle, so the window stays put through ordinary jumps.
+#define WRAM16(a) (g_wram[a] | g_wram[(a) + 1] << 8)
+#define GAMEMODE_LEVEL 0x8819     // gamemode_pointer ($24): the level's loop
+#define ACTIVE_KONG 0x0593        // the active Kong's sprite (in WRAM)
+#define CAMERA_Y 0x17c2
+#define BAND_TOP 56               // the Kong's feet stay in GBA lines 56-128
+#define BAND_BOTTOM 128
+#define CROP_STEP 4               // lines a frame the window moves at most
+
+static void choose_view(void) {
+  static int crop_y = -1;
+  uint16_t kong = WRAM16(ACTIVE_KONG);
+  uint16_t sprite = kong >= 0x0de2 && kong < 0x16fe ? WRAM16(kong) : 0;
+  if (WRAM16(0x24) != GAMEMODE_LEVEL || (sprite != 0x00e4 && sprite != 0x00e8)) {
+    crop_y = -1;
+    render_set_view(RENDER_FIT, 0);
+    return;
+  }
+  // The sprite's Y is about where its feet are, in the level; less the
+  // camera's, its line on the SNES's screen.
+  int feet = (int16_t)(WRAM16(kong + 0x0a) - WRAM16(CAMERA_Y)) - 10;
+  int want = crop_y < 0 ? feet - (BAND_TOP + BAND_BOTTOM) / 2 : crop_y;
+  if (feet < want + BAND_TOP) want = feet - BAND_TOP;
+  if (feet > want + BAND_BOTTOM) want = feet - BAND_BOTTOM;
+  if (want < 0) want = 0;
+  if (want > 224 - 160) want = 224 - 160;
+  if (crop_y >= 0) {
+    if (want > crop_y + CROP_STEP) want = crop_y + CROP_STEP;
+    if (want < crop_y - CROP_STEP) want = crop_y - CROP_STEP;
+  }
+  crop_y = want;
+  render_set_view(RENDER_CROP, crop_y);
+}
+
 uint16_t on_wait(uint32_t wai_pc) {
+  choose_view();
   render_frame();
 #ifdef SHOT_LOG
   // gbarun -t takes the picture in the frame after this one: keep it there.

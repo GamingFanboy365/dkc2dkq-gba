@@ -27,10 +27,9 @@
 // - The SNES's 256x224 screen on the 240x160 one (render_set_view): all
 //   224 lines, a GBA line showing every 1.4th SNES line (its scroll set by
 //   HBlank DMA, as for HDMA), the sprites shrunk to match as affine sprites;
-//   or a window of it at full size, at a fixed place. Columns 8-247 either
-//   way.
-// Not yet: other color math, windows, per-tile priority, Mode 7, a crop
-// that follows the player.
+//   or 160 of its lines at full size, from a line main.c picks (in the
+//   levels, around the Kong). Columns 8-247 either way.
+// Not yet: other color math, windows, per-tile priority, Mode 7.
 #include "render.h"
 
 #include <stdbool.h>
@@ -40,19 +39,22 @@
 #include "snes_hw.h"
 
 #define CROP_X 8
-#define CROP_Y 32
 #define LINES 160
 
 // The view: which SNES line each GBA line shows. RENDER_CROP shows lines
-// CROP_Y.. as they are; RENDER_FIT all 224, every 1.4th (GBA line y shows
+// g_crop_y.. as they are; RENDER_FIT all 224, every 1.4th (GBA line y shows
 // SNES line y * 7 / 5), with the sprites shrunk to match by affine sprites.
-static int g_view = RENDER_FIT;
+static int g_view = -1, g_crop_y;
 static uint8_t g_src_line[LINES];
 
-void render_set_view(int view) {
+void render_set_view(int view, int crop_y) {
+  if (crop_y < 0) crop_y = 0;
+  if (crop_y > 224 - LINES) crop_y = 224 - LINES;
+  if (view == g_view && (view == RENDER_FIT || crop_y == g_crop_y)) return;
   g_view = view;
+  g_crop_y = crop_y;
   for (int y = 0; y < LINES; y++)
-    g_src_line[y] = (uint8_t)(view == RENDER_FIT ? y * 7 / 5 : y + CROP_Y);
+    g_src_line[y] = (uint8_t)(view == RENDER_FIT ? y * 7 / 5 : y + crop_y);
 }
 
 #define BG_VRAM ((volatile uint8_t *)0x06000000)
@@ -409,7 +411,7 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
     int x = (w0 & 0xff) | (high & 1) << 8;
     if (x >= 256) x -= 512;
     int y = w0 >> 8;
-    int sy = y - CROP_Y;   // the SNES shows a sprite from line Y (backgrounds from VOFS + 1)
+    int sy = y - g_crop_y;   // the SNES shows a sprite from line Y (backgrounds from VOFS + 1)
     int gx = x - CROP_X;
     uint16_t *o = &f->oam[i * 4];
     // Off the window (with SNES's wrap at the bottom of the 256 lines).
@@ -444,7 +446,7 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
 // ---- the frame ----
 
 void render_init(void) {
-  render_set_view(g_view);
+  render_set_view(RENDER_FIT, 0);
   for (int b = 0; b < 256; b++) {
     uint32_t e = 0;
     for (int x = 0; x < 8; x++) e |= (uint32_t)((b >> (7 - x)) & 1) << (4 * x);
