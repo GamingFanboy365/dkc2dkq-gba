@@ -26,6 +26,10 @@
  *               .vram (96 KiB), .pal (1 KiB) and .oam (1 KiB)  [MEMDUMP=1]
  *   -q          quiet (no per-shot log lines)
  *
+ * PROFILE=FILE samples the program counter a few hundred times a frame (after
+ * each of the core's steps to its next hardware event) and writes "PC COUNT"
+ * lines; tools/profile_report.py sums them by function.
+ *
  * What the game prints through mGBA's debug registers (0x04FFF600) goes to
  * stdout, a line per message. With SHOT_ON=1 (or -t), a message "shot N"
  * instead takes a picture, named by N, of the frame after the one it was
@@ -52,6 +56,8 @@
 #include <mgba/core/config.h>
 #include <mgba/core/log.h>
 #include <mgba/core/serialize.h>
+#include <mgba/internal/arm/arm.h>
+#include <mgba/internal/gba/gba.h>
 #include <mgba-util/vfs.h>
 
 #include <ctype.h>
@@ -282,6 +288,31 @@ static void writeState(struct mCore* core, const char* path) {
 	printf("state %s\n", path);
 }
 
+/* PROFILE: samples of the program counter, a few hundred a frame. */
+static uint32_t* profilePcs;
+static uint32_t* profileCounts;
+static size_t profileCap = 1 << 20;
+
+static void profileSample(uint32_t pc) {
+	size_t h = (pc * 2654435761u) & (profileCap - 1);
+	while (profilePcs[h] && profilePcs[h] != pc) {
+		h = (h + 1) & (profileCap - 1);
+	}
+	profilePcs[h] = pc;
+	profileCounts[h]++;
+}
+
+/* Runs a frame in the core's small steps (to the next hardware event),
+   sampling the program counter after each. */
+static void runFrameProfiled(struct mCore* core) {
+	uint32_t start = core->frameCounter(core);
+	struct GBA* gba = core->board;
+	while (core->frameCounter(core) == start) {
+		core->runLoop(core);
+		profileSample((uint32_t) gba->cpu->gprs[ARM_PC]);
+	}
+}
+
 /* SHOT_ON: the game asks for a picture by printing "shot N". */
 static bool shotOnPrint;
 static int printedShot = -1, printedShotCountdown;
@@ -359,6 +390,10 @@ int main(int argc, char** argv) {
 	stateOutArg = opt(stateOutArg, "STATE_OUT");
 	stateOutAtArg = opt(stateOutAtArg, "STATE_OUT_AT");
 	saveArg = opt(saveArg, "SAVE");
+	if (getenv("PROFILE") && *getenv("PROFILE")) {
+		profilePcs = calloc(profileCap, sizeof(uint32_t));
+		profileCounts = calloc(profileCap, sizeof(uint32_t));
+	}
 	if (getenv("SHOT_ON") && strcmp(getenv("SHOT_ON"), "1") == 0) {
 		shotOnPrint = true;
 	}
@@ -448,7 +483,11 @@ int main(int argc, char** argv) {
 			--segLeft;
 		}
 		core->setKeys(core, keys);
-		core->runFrame(core);
+		if (profilePcs) {
+			runFrameProfiled(core);
+		} else {
+			core->runFrame(core);
+		}
 		if (printedShotCountdown && --printedShotCountdown == 0) {
 			shoot(core, outDir, prefix, (unsigned) printedShot, quiet);
 			if (memDump) {
@@ -466,6 +505,18 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	if (profilePcs) {
+		FILE* pf = fopen(getenv("PROFILE"), "w");
+		if (!pf) {
+			die("cannot write %s", getenv("PROFILE"));
+		}
+		for (size_t i = 0; i < profileCap; i++) {
+			if (profilePcs[i]) {
+				fprintf(pf, "%08x %u\n", profilePcs[i], profileCounts[i]);
+			}
+		}
+		fclose(pf);
+	}
 	core->deinit(core);
 	free(video);
 	free(segs);

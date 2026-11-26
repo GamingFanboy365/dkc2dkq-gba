@@ -55,7 +55,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   # ---- the GBA ----
   set(GBA_FLAGS -mthumb -O2 -Wall -Wno-unused-label)
   add_executable(dkc2.elf gba/crt0.S gba/main.c gba/render.c gba/debug.c gba/libc.c ${PORT_SOURCES} ${GEN_SOURCES})
-  target_include_directories(dkc2.elf PRIVATE gba/include gba src src/budget ${GEN})
+  target_include_directories(dkc2.elf PRIVATE gba/include gba src ${GEN})
   target_compile_options(dkc2.elf PRIVATE $<$<COMPILE_LANGUAGE:C>:${GBA_FLAGS}>)
   target_compile_definitions(dkc2.elf PRIVATE "EWRAM_DATA=__attribute__((section(\".ewram_bss\")))")
   if(DKC2_SYNC_LOG)
@@ -75,7 +75,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   endif()
   # The C library mustn't turn its own loops into calls to itself.
   set_source_files_properties(gba/libc.c PROPERTIES COMPILE_OPTIONS "-fno-builtin")
-  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+  # The recompiled code: Thumb's pc-relative ranges are too short for its
+  # biggest functions; ARM it is.
+  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-marm")
   target_link_options(dkc2.elf PRIVATE -T ${CMAKE_SOURCE_DIR}/gba/gba.ld -Wl,-Map=${CMAKE_BINARY_DIR}/dkc2.map)
   set_target_properties(dkc2.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/gba/gba.ld)
   add_custom_command(

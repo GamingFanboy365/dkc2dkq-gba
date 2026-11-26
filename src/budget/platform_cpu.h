@@ -7,9 +7,18 @@
 
 #include <stdint.h>
 
+#include "snes_mem.h"
+
 extern uint32_t g_cycles, g_frame_end;
 #define CYC(n) (g_cycles += (n) * 7)
 #define EVENT_PENDING() (g_cycles >= g_frame_end)
+// A frame starts at VBlank: a frame the game waited in ends early, a lag
+// frame late.
+#define MASTER_CYCLES_PER_FRAME (1364 * 262)
+#define FRAME_START() do { \
+    if (g_cycles < g_frame_end) g_cycles = g_frame_end; \
+    g_frame_end = g_cycles + MASTER_CYCLES_PER_FRAME; } while (0)
+#define CYCLE_BUDGET 1
 
 #ifdef CHECK_ASSUMPTIONS
 void assume_failed(uint32_t pc, int m, int x);

@@ -5,6 +5,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// The memory map: LakeSnes's, through hostrun.c.
+uint8_t rd8(uint32_t addr);
+void wr8(uint32_t addr, uint8_t value);
+static inline uint8_t rd8_b0(uint16_t a) { return rd8(a); }
+static inline void wr8_b0(uint16_t a, uint8_t v) { wr8(a, v); }
+
 // A rough clock: 7 master cycles per CPU cycle of the instruction's base
 // count. The hardware (LakeSnes's PPU, DMA, APU) is caught up to it before
 // every I/O access and when polled.

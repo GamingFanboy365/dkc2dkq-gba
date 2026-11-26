@@ -294,10 +294,15 @@ void render_init(void) {
   REG_DISPCNT = 0x0080;   // blank until the first frame
 }
 
+uint32_t g_render_cycles, g_idle_cycles;
+
 void render_frame(void) {
   // The game may finish frames faster than the GBA shows them: wait for the
   // last one to go on screen (this also paces the game to 60 frames).
+  uint32_t t0 = cycles_now();
   while (g_pending >= 0) {}
+  uint32_t t1 = cycles_now();
+  g_idle_cycles += t1 - t0;
   int fi = g_shown ^ 1;
   Frame *f = &g_frames[fi];
   g_frame_stamp++;
@@ -370,6 +375,7 @@ void render_frame(void) {
       if (f->scroll[gy + 1][k] != f->scroll[1][k]) { f->per_line_scroll = true; break; }
 
   g_pending = fi;
+  g_render_cycles += cycles_now() - t1;
 }
 
 // ---- VBlank ----

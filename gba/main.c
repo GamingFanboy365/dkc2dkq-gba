@@ -19,9 +19,14 @@ static int g_frame;
 
 static uint16_t read_joypad(void);
 
+volatile uint8_t g_lag_event, g_frame_vblanks;
+
 void irq_handler(void) {
   uint16_t flags = REG_IF;
-  if (flags & 1) render_vblank();
+  if (flags & 1) {
+    render_vblank();
+    if (++g_frame_vblanks > LAG_VBLANKS) g_lag_event = 1;
+  }
   REG_IF = flags;
   REG_BIOS_IF |= flags;
 }
@@ -113,11 +118,16 @@ int main(void) {
       for (;;) {}
     }
     if (++in_window == 60) {
-      // The mean, total / 60, by shifts (1/64 + 1/1024 + 1/16384: 0.02% low).
-      uint32_t mean = (total >> 6) + (total >> 10) + (total >> 14);
-      debug_printf("frames %d-%d: %u cycles a frame on average, %u at most (a GBA frame is 280896)",
-                   g_frame - 59, g_frame, mean, worst);
+      // Means over 60 frames, total / 60 by shifts (1/64 + 1/1024 + 1/16384:
+      // 0.02% low). The game's logic is the frame's time less drawing and
+      // waiting for VBlank.
+#define MEAN60(t) (((t) >> 6) + ((t) >> 10) + ((t) >> 14))
+      uint32_t logic = total - g_render_cycles - g_idle_cycles;
+      debug_printf("frames %d-%d: logic %u, drawing %u, idle %u cycles a frame; slowest frame %u "
+                   "(a GBA frame is 280896)", g_frame - 59, g_frame, MEAN60(logic),
+                   MEAN60(g_render_cycles), MEAN60(g_idle_cycles), worst);
       total = worst = 0;
+      g_render_cycles = g_idle_cycles = 0;
       in_window = 0;
     }
   }
