@@ -180,13 +180,12 @@ static inline __attribute__((always_inline)) void wr16_b0(uint16_t a, uint16_t v
 static inline uint32_t rd24_b0(uint16_t a) { return rd16_b0(a) | (uint32_t)rd8_b0((uint16_t)(a + 2)) << 16; }
 
 static inline void push8(uint8_t v) { wr8_b0(cpu.s, v); cpu.s--; }
-static inline void push16(uint16_t v) { wr8_b0(cpu.s, v >> 8); wr8_b0((uint16_t)(cpu.s - 1), (uint8_t)v); cpu.s -= 2; }
+static inline void push16(uint16_t v) { wr16_b0((uint16_t)(cpu.s - 1), v); cpu.s -= 2; }
 static inline uint8_t pull8(void) { cpu.s++; return rd8_b0(cpu.s); }
 static inline uint16_t pull16(void) {
-  uint16_t lo = rd8_b0((uint16_t)(cpu.s + 1));
-  uint16_t hi = rd8_b0((uint16_t)(cpu.s + 2));
+  uint16_t v = rd16_b0((uint16_t)(cpu.s + 1));
   cpu.s += 2;
-  return lo | hi << 8;
+  return v;
 }
 
 // ---- dispatch (src/runtime.c; the entry table is generated) ----

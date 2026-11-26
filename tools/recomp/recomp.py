@@ -749,7 +749,13 @@ class RegionEmitter:
             if i.next in region_set and (k + 1 == len(region) or region[k + 1].addr != i.next):
                 targets.add(i.next)
         entries = [i for i in region if i.addr in self.entries]
-        lines = [f"uint32_t {name}(uint32_t entry) {{", "  LOAD();", "  switch (entry & 0xffff) {"]
+        lines = [f"uint32_t {name}(uint32_t entry) {{", "  LOAD();"]
+        # Most calls enter at the first instruction: tested before the
+        # switch (a search through all the entries).
+        first = region[0]
+        if first.addr in self.entries:
+            lines.append(f"  if ((entry & 0xffff) == {hx(first.addr & 0xFFFF)}) {{ {self.assume(first) or ''} goto L_{first.addr:06x}; }}")
+        lines.append("  switch (entry & 0xffff) {")
         for i in entries:
             chk = self.assume(i) or ""
             lines.append(f"    case {hx(i.addr & 0xFFFF)}: {chk} goto L_{i.addr:06x};")

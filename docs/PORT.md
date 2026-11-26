@@ -64,7 +64,7 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 |---|---|---|---|
 | First build | 1,530,000 | 920,000 | 2,450,000 (8.7 frames) |
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
-| Now | 325,000 | 385,000 | 710,000 (2.5 frames) |
+| Now | 314,000 | 385,000 | 700,000 (2.5 frames) |
 
 (Measured over game frames 2340-2399 of the play session, in the level; an
 earlier "315,000 for drawing" was a quieter stretch.)
@@ -84,7 +84,8 @@ levels' transitions spend their time in).
 In the generated code, D and DB are locals, and an access whose address is
 constant when they are has a copy for the values the trace saw there;
 indexed accesses test their index's range once and go straight to WRAM or
-ROM, and block moves copy by pointers.
+ROM, block moves copy by pointers, and a function tests its first entry
+before searching the others.
 What's left: the game's own logic (the recompiled code:
 about 60%: executing it, not its memory: it makes only ~5,000 WRAM
 accesses a frame, half in the direct page and stack), the map rows, HDMA. IWRAM (32 KB) and EWRAM (256 KB, half of
