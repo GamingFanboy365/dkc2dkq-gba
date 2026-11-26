@@ -40,7 +40,7 @@ MAX_REGION = 1500
 
 # Routines with native versions (src/native.c): their recompiled code is
 # emitted as R_xxxxxx_recomp, which the native function falls back on.
-NATIVE = {0xB59F40}
+NATIVE = {0xB59F40, 0x80E580, 0xB5A8DA}
 
 
 def rom_offset(addr):
