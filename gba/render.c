@@ -41,20 +41,34 @@
 #define CROP_X 8
 #define LINES 160
 
-// The view: which SNES line each GBA line shows. RENDER_CROP shows lines
-// g_crop_y.. as they are; RENDER_FIT all 224, every 1.4th (GBA line y shows
-// SNES line y * 7 / 5), with the sprites shrunk to match by affine sprites.
-static int g_view = -1, g_crop_y;
+// The view: which SNES line each GBA line shows. SNES lines top to
+// top + lines - 1 on the GBA's 160: GBA line y shows SNES line
+// top + y * lines / 160 (with more than 160, some lines are left out), the
+// sprites shrunk to match by affine sprites.
+static int g_view_top = -1, g_view_lines;
+static int32_t g_view_scale;   // 160 / lines, 16.16
 static uint8_t g_src_line[LINES];
 
-void render_set_view(int view, int crop_y) {
-  if (crop_y < 0) crop_y = 0;
-  if (crop_y > 224 - LINES) crop_y = 224 - LINES;
-  if (view == g_view && (view == RENDER_FIT || crop_y == g_crop_y)) return;
-  g_view = view;
-  g_crop_y = crop_y;
-  for (int y = 0; y < LINES; y++)
-    g_src_line[y] = (uint8_t)(view == RENDER_FIT ? y * 7 / 5 : y + crop_y);
+// a / b (there's no division in this build's C library); rarely called.
+static uint32_t udiv(uint32_t a, uint32_t b) {
+  uint32_t q = 0, r = 0;
+  for (int i = 31; i >= 0; i--) {
+    r = r << 1 | ((a >> i) & 1);
+    if (r >= b) { r -= b; q |= 1u << i; }
+  }
+  return q;
+}
+
+void render_set_view(int top, int lines) {
+  if (lines < LINES) lines = LINES;
+  if (lines > 224) lines = 224;
+  if (top < 0) top = 0;
+  if (top > 224 - lines) top = 224 - lines;
+  if (top == g_view_top && lines == g_view_lines) return;
+  g_view_top = top;
+  g_view_lines = lines;
+  g_view_scale = (int32_t)udiv(LINES << 16, lines);
+  for (int y = 0; y < LINES; y++) g_src_line[y] = (uint8_t)(top + udiv(y * lines, LINES));
 }
 
 #define BG_VRAM ((volatile uint8_t *)0x06000000)
@@ -403,7 +417,8 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
     g_obj_base_seen = base;
     g_obj_gap_seen = gap;
   }
-  bool fit = g_view == RENDER_FIT;
+  int top = g_view_top;
+  bool fit = g_view_lines != LINES;
   for (int i = 0; i < 128; i++) {
     uint16_t w0 = g_hw.oam[i * 2], w1 = g_hw.oam[i * 2 + 1];
     uint8_t high = (g_hw.high_oam[i >> 2] >> ((i & 3) * 2)) & 3;
@@ -411,15 +426,16 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
     int x = (w0 & 0xff) | (high & 1) << 8;
     if (x >= 256) x -= 512;
     int y = w0 >> 8;
-    int sy = y - g_crop_y;   // the SNES shows a sprite from line Y (backgrounds from VOFS + 1)
+    int sy = y - top;   // the SNES shows a sprite from line Y (backgrounds from VOFS + 1)
     int gx = x - CROP_X;
     uint16_t *o = &f->oam[i * 4];
     // Off the window (with SNES's wrap at the bottom of the 256 lines).
     if (fit) {
       // An affine sprite draws its picture shrunk around the middle of its
-      // box: the box goes where that puts SNES line Y at GBA line Y * 5 / 7.
+      // box: the box goes where that puts SNES line Y at GBA line
+      // (Y - top) * 160 / lines.
       if (y >= 224) y -= 256;
-      sy = ((2 * y + size) * 5 / 7 - size) >> 1;
+      sy = ((((2 * (y - top) + size) * g_view_scale) >> 16) - size) >> 1;
     }
     if (sy >= LINES) sy -= 256;
     if (gx <= -size || gx >= 240 || sy <= -size || sy >= LINES) {
@@ -446,7 +462,7 @@ __attribute__((noinline)) static void draw_sprites(Frame *f) {
 // ---- the frame ----
 
 void render_init(void) {
-  render_set_view(RENDER_FIT, 0);
+  render_set_view(0, 224);
   for (int b = 0; b < 256; b++) {
     uint32_t e = 0;
     for (int x = 0; x < 8; x++) e |= (uint32_t)((b >> (7 - x)) & 1) << (4 * x);
@@ -534,13 +550,14 @@ void render_frame(void) {
   }
   if (!(tm & 0x10)) dispcnt &= ~0x1000;
   draw_sprites(f);
-  // The fit view's sprite matrices, 0-3 for no flip, X, Y, both: a step of
-  // 7/5 of a texel a line, and -1 for a flip.
+  // The sprite matrices of a view that leaves lines out, 0-3 for no flip, X,
+  // Y, both: a step of lines / 160 texels a line, and -1 for a flip.
+  int pd = (int)udiv(g_view_lines << 8, LINES);
   for (int m = 0; m < 4; m++) {
     f->oam[m * 16 + 3] = (uint16_t)((m & 1) ? -256 : 256);   // pa
     f->oam[m * 16 + 7] = 0;                                  // pb
     f->oam[m * 16 + 11] = 0;                                 // pc
-    f->oam[m * 16 + 15] = (uint16_t)((m & 2) ? -358 : 358);  // pd
+    f->oam[m * 16 + 15] = (uint16_t)((m & 2) ? -pd : pd);    // pd
   }
 
   // Palettes: SNES BG colors 0-127, BG3's 2bpp palettes as 16-color ones,
