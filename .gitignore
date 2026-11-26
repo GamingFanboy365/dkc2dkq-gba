@@ -19,3 +19,5 @@ DMA_log*
 *.trace
 build*/
 __pycache__/
+# The reference traces the recompiler reads (addresses and flags, no game data)
+!traces/*.trace
