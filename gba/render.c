@@ -360,8 +360,9 @@ static uint32_t g_bg_setup[3];          // what the cells were drawn for: map, s
 static uint32_t g_visible_rows[3];       // GBA map rows shown this frame (bits)
 static uint8_t g_row_col0[3][32];        // the first GBA column shown in each (0xff: all)
 
-static uint16_t g_hofs[3][224], g_vofs[3][224];
-EWRAM_DATA static uint16_t g_fixed_line[224];
+#define ALIGNED4 __attribute__((aligned(4)))   // (for word stores)
+ALIGNED4 static uint16_t g_hofs[3][224], g_vofs[3][224];
+EWRAM_DATA ALIGNED4 static uint16_t g_fixed_line[224];
 // Per SNES line, the color window (W1, or W2 if W1 is off): left, right,
 // bit 16 on, bit 17 inverted.
 EWRAM_DATA static uint32_t g_line_win[224];
@@ -369,7 +370,6 @@ EWRAM_DATA static uint32_t g_line_win[224];
 // Per SNES line, what HDMA may change besides the scroll: the main and
 // sub screens' layers, color math's settings, and up to MAX_LINE_COLORS
 // CGRAM entries (note_cgram_write).
-#define ALIGNED4 __attribute__((aligned(4)))   // (for memset's word stores)
 ALIGNED4 static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
 static uint8_t g_hdma_color[MAX_LINE_COLORS], g_num_hdma_colors;
 EWRAM_DATA static uint16_t g_line_color[224][MAX_LINE_COLORS];
@@ -1016,6 +1016,7 @@ IWRAM_CODE void render_frame(void) {
     capture_unchanging();
   } else {
     g_lines_unchanging = false;
+    hw_hdma_fast_forget();
     hw_hdma_frame(capture_line);
   }
 

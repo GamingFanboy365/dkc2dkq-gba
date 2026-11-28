@@ -65,7 +65,7 @@ faster), and when it's late a frame's picture is skipped, never two in a
 row (`gba/main.c`): the game runs as fast as its logic allows, the picture
 at half that or more. The cartridge's timing lines say how many VBlanks
 each 60 of the game's frames took (60: full speed); Pirate Panic takes
-about 67, 90% of full speed (76-86 in its busiest stretch).
+about 66, 90% of full speed (more in its busiest stretch).
 
 GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 
@@ -75,7 +75,7 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
 | Before HDMA by channel | 293,000 | 276,000 | 569,000 (2.0 frames) |
 | HDMA by channel | 293,000 | 174,000 | 467,000 (1.7 frames) |
-| Now | 218,000 | 174,000 | 392,000 (1.4 frames) |
+| Now | 218,000 | 161,000 | 379,000 (1.35 frames) |
 
 (Measured over game frames 2340-2399 of the play session, in the level,
 with every frame drawn; an earlier "315,000 for drawing" was a quieter

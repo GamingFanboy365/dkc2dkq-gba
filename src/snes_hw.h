@@ -99,6 +99,8 @@ extern uint8_t g_hdma_wrote;
 // channel by channel: the lines' BG1-3 scroll and fixed color (r | g << 5 |
 // b << 10) into the arrays. false for other frames, having done nothing.
 bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], uint16_t *fixed);
+// Before anything else writes those arrays: they hold what they hold.
+void hw_hdma_fast_forget(void);
 extern void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
 // The start of VBlank: the NMI flag, and the joypads read (auto-joypad).
 void hw_vblank(uint16_t joy1);

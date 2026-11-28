@@ -590,6 +590,41 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
 // writes, the same on every line). What it leaves in g_hw is what
 // hw_hdma_frame would. For any other frame, false, g_hw untouched (the
 // arrays may not be).
+// The value each of hw_hdma_frame_fast's arrays (BG1-3 HOFS, VOFS, the
+// fixed color) holds on all its lines, from its last fill, or -1.
+EWRAM_DATA static int32_t g_fast_held[7];   // (as -1: the first frame forgets)
+static bool g_fast_held_set;
+void hw_hdma_fast_forget(void) {
+  for (int i = 0; i < 7; i++) g_fast_held[i] = -1;
+  g_fast_held_set = true;
+}
+__attribute__((noinline)) static void fill16(uint16_t *p, uint16_t v) {   // 224 entries (4-byte aligned)
+  uint32_t w = v | (uint32_t)v << 16, *q = (uint32_t *)p;
+  for (int i = 0; i < 112; i++) q[i] = w;
+}
+
+// hw_hdma_frame_fast's arrays that no channel writes: the value at the
+// start on every line (unless the array holds that already).
+__attribute__((noinline)) static void fill_unwritten(uint32_t regs_seen, int nfixed, uint16_t hofs[3][224],
+                                                     uint16_t vofs[3][224], uint16_t *fixed, uint16_t fixed_now) {
+  if (!g_fast_held_set) hw_hdma_fast_forget();
+  for (int i = 0; i < 3; i++) {
+    uint16_t h = g_hw.hofs[i], v = g_hw.vofs[i];
+    if (!(regs_seen & (1u << (0x0d + 2 * i))) && g_fast_held[i] != h) {
+      fill16(hofs[i], h);
+      g_fast_held[i] = h;
+    }
+    if (!(regs_seen & (1u << (0x0e + 2 * i))) && g_fast_held[3 + i] != v) {
+      fill16(vofs[i], v);
+      g_fast_held[3 + i] = v;
+    }
+  }
+  if (!nfixed && g_fast_held[6] != fixed_now) {
+    fill16(fixed, fixed_now);
+    g_fast_held[6] = fixed_now;
+  }
+}
+
 WARM_CODE bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], uint16_t *fixed) {
   if (g_ppu_write_hook) return false;
   struct {
@@ -621,17 +656,8 @@ WARM_CODE bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], 
     ch[n].last = -1;
     n++;
   }
-  // What no channel writes, as at the start.
   uint16_t fixed_now = (uint16_t)(g_hw.fixed_r | g_hw.fixed_g << 5 | g_hw.fixed_b << 10);
-  for (int i = 0; i < 3; i++) {
-    uint16_t h = g_hw.hofs[i], v = g_hw.vofs[i];
-    if (!(regs_seen & (1u << (0x0d + 2 * i))))
-      for (int line = 0; line < 224; line++) hofs[i][line] = h;
-    if (!(regs_seen & (1u << (0x0e + 2 * i))))
-      for (int line = 0; line < 224; line++) vofs[i][line] = v;
-  }
-  if (!nfixed)
-    for (int line = 0; line < 224; line++) fixed[line] = fixed_now;
+  fill_unwritten(regs_seen, nfixed, hofs, vofs, fixed, fixed_now);
   // Each channel's lines: a transfer on the lines that have one; on the
   // others (a table entry's after its first, without its repeat bit) only
   // the count goes down, so those are done together.
@@ -656,7 +682,8 @@ WARM_CODE bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], 
       cur = (badr & 1) ? g_hw.hofs[i] : g_hw.vofs[i];
       out = (badr & 1) ? hofs[i] : vofs[i];
     }
-    int line = 0;
+    g_fast_held[is_fixed ? 6 : (badr & 1) ? (badr - 0x0d) >> 1 : 3 + ((badr - 0x0e) >> 1)] = -1;
+    int line = 0, last = -1;
     while (line < 224) {
       if (!active) {
         for (; line < 224; line++) out[line] = cur;
@@ -680,7 +707,7 @@ WARM_CODE bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], 
           cur = (uint16_t)((v << 8 | tb[t]) & 0x3ff);   // what the latches leave
           t += 2;
         }
-        ch[k].last = line * 8 + ch[k].c;
+        last = line;
         out[line++] = cur;
         lines--;
         do_transfer = lines >> 7;
@@ -692,6 +719,7 @@ WARM_CODE bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], 
       if (lines == 0) active = 0;
       do_transfer = 1;
     }
+    if (last >= 0) ch[k].last = last * 8 + ch[k].c;
     ch[k].t = t;
     ch[k].lines = lines;
     ch[k].do_transfer = do_transfer;
