@@ -835,6 +835,8 @@ HOT_CODE uint8_t rd8_slow(uint32_t a) {
     else if (lo == 0x4016) v = serial_read(0) | (g_hw.open_bus & 0xfc);
     else if (lo == 0x4017) v = serial_read(1) | (g_hw.open_bus & 0xe0) | 0x1c;
     else if (lo >= 0x2100 && lo < 0x2200) v = bbus_read((uint8_t)lo);
+    else if (lo == 0x4216) v = (uint8_t)g_hw.multiply_result;   // (the usual ones here)
+    else if (lo == 0x4217) v = g_hw.multiply_result >> 8;
     else if (lo >= 0x4200 && lo < 0x4400) v = cpu_reg_read(lo);
     else v = g_hw.open_bus;
     g_hw.open_bus = v;
@@ -851,6 +853,9 @@ HOT_CODE void wr8_slow(uint32_t a, uint8_t v) {
     if (lo < 0x2000) g_wram[lo] = v;
     else if (lo >= 0x6000 && lo < 0x8000) g_sram[(((bank & 0x3f) << 13) | (lo & 0x1fff)) & 0x7ff] = v;
     else if (lo >= 0x2100 && lo < 0x2200) bbus_write((uint8_t)lo, v);
+    else if (lo >= 0x4300 && lo < 0x4380) g_hw.dma[(lo >> 4) & 7][lo & 0xf] = v;   // (the usual ones here)
+    else if (lo == 0x4202) g_hw.multiply_a = v;
+    else if (lo == 0x4203) g_hw.multiply_result = (uint16_t)(g_hw.multiply_a * v);
     else if (lo >= 0x4200 && lo < 0x4400) cpu_reg_write(lo, v);
     else if (lo == 0x4016) {
       g_hw.strobe = v & 1;
