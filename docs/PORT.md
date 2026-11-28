@@ -65,7 +65,7 @@ faster), and when it's late a frame's picture is skipped, never two in a
 row (`gba/main.c`): the game runs as fast as its logic allows, the picture
 at half that or more. The cartridge's timing lines say how many VBlanks
 each 60 of the game's frames took (60: full speed); Pirate Panic takes
-about 71, 85% of full speed (80-90 in its busiest stretch).
+about 67, 90% of full speed (76-86 in its busiest stretch).
 
 GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 
@@ -75,7 +75,7 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
 | Before HDMA by channel | 293,000 | 276,000 | 569,000 (2.0 frames) |
 | HDMA by channel | 293,000 | 174,000 | 467,000 (1.7 frames) |
-| Now | 231,000 | 174,000 | 405,000 (1.4 frames) |
+| Now | 218,000 | 174,000 | 392,000 (1.4 frames) |
 
 (Measured over game frames 2340-2399 of the play session, in the level,
 with every frame drawn; an earlier "315,000 for drawing" was a quieter
@@ -105,7 +105,8 @@ indexed accesses test their index's range once and go straight to WRAM or
 ROM, block moves copy by pointers, and a function tests its first entry
 before searching the others. A call, a return or an exit stores only the
 registers the function may have changed since it loaded them (a forward
-analysis over its gotos): a third of the stores it made before.
+analysis over its gotos): a third of the stores it made before. ADC and
+SBC are a few instructions inline, decimal mode (rare) out of line.
 What's left: the game's own logic (the recompiled code:
 about 60%: executing it, not its memory: it makes only ~5,000 WRAM
 accesses a frame, half in the direct page and stack), the map rows, and

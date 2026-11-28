@@ -237,7 +237,7 @@ uint32_t interrupt(uint16_t vector_addr, uint32_t resume_pc);
 
 // ADC and SBC, binary and decimal; the decimal steps are LakeSnes's
 // (third_party/lakesnes/cpu.c), the reference these are checked against.
-static inline uint8_t adc8(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
+static inline uint8_t adc8_full(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
   int r;
   if (cpu.dflag) {
     r = (a & 0xf) + (v & 0xf) + *c;
@@ -251,7 +251,7 @@ static inline uint8_t adc8(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
   *c = r > 0xff;
   return (uint8_t)r;
 }
-static inline uint16_t adc16(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
+static inline uint16_t adc16_full(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
   int r;
   if (cpu.dflag) {
     r = (a & 0xf) + (v & 0xf) + *c;
@@ -269,7 +269,7 @@ static inline uint16_t adc16(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
   *c = r > 0xffff;
   return (uint16_t)r;
 }
-static inline uint8_t sbc8(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
+static inline uint8_t sbc8_full(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
   v ^= 0xff;
   int r;
   if (cpu.dflag) {
@@ -284,7 +284,7 @@ static inline uint8_t sbc8(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
   *c = r > 0xff;
   return (uint8_t)r;
 }
-static inline uint16_t sbc16(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
+static inline uint16_t sbc16_full(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
   v ^= 0xffff;
   int r;
   if (cpu.dflag) {
@@ -302,6 +302,53 @@ static inline uint16_t sbc16(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
   if (cpu.dflag && r < 0x10000) r -= 0x6000;
   *c = r > 0xffff;
   return (uint16_t)r;
+}
+
+// Decimal mode, rare: out of line, the result, carry and overflow packed
+// (so the flags' locals needn't live in memory). Binary: inline, a few
+// instructions, overflow without branches.
+uint32_t adc8_decimal(uint8_t a, uint8_t v, uint8_t c);
+uint32_t adc16_decimal(uint16_t a, uint16_t v, uint8_t c);
+uint32_t sbc8_decimal(uint8_t a, uint8_t v, uint8_t c);
+uint32_t sbc16_decimal(uint16_t a, uint16_t v, uint8_t c);
+#define ADC_UNPACK(r, bits) (*c = ((r) >> (bits)) & 1, *ov = ((r) >> ((bits) + 1)) & 1)
+static inline __attribute__((always_inline)) uint8_t adc8(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
+  if (__builtin_expect(cpu.dflag, 0)) {
+    uint32_t r = adc8_decimal(a, v, *c);
+    ADC_UNPACK(r, 8);
+    return (uint8_t)r;
+  }
+  uint32_t r = (uint32_t)a + v + *c;
+  *ov = ((~(a ^ v) & (a ^ r)) >> 7) & 1;
+  *c = (r >> 8) & 1;
+  return (uint8_t)r;
+}
+static inline __attribute__((always_inline)) uint16_t adc16(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
+  if (__builtin_expect(cpu.dflag, 0)) {
+    uint32_t r = adc16_decimal(a, v, *c);
+    ADC_UNPACK(r, 16);
+    return (uint16_t)r;
+  }
+  uint32_t r = (uint32_t)a + v + *c;
+  *ov = ((~(a ^ v) & (a ^ r)) >> 15) & 1;
+  *c = (r >> 16) & 1;
+  return (uint16_t)r;
+}
+static inline __attribute__((always_inline)) uint8_t sbc8(uint8_t a, uint8_t v, uint8_t *c, uint8_t *ov) {
+  if (__builtin_expect(cpu.dflag, 0)) {
+    uint32_t r = sbc8_decimal(a, v, *c);
+    ADC_UNPACK(r, 8);
+    return (uint8_t)r;
+  }
+  return adc8(a, (uint8_t)~v, c, ov);
+}
+static inline __attribute__((always_inline)) uint16_t sbc16(uint16_t a, uint16_t v, uint8_t *c, uint8_t *ov) {
+  if (__builtin_expect(cpu.dflag, 0)) {
+    uint32_t r = sbc16_decimal(a, v, *c);
+    ADC_UNPACK(r, 16);
+    return (uint16_t)r;
+  }
+  return adc16(a, (uint16_t)~v, c, ov);
 }
 
 #endif

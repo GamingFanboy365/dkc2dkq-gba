@@ -118,3 +118,16 @@ uint32_t interrupt(uint16_t vector_addr, uint32_t resume_pc) {
   cpu.pb = 0;
   return rd16(vector_addr);
 }
+
+// ADC and SBC in decimal mode (cpu65.h): the result, then the carry and the
+// overflow above it.
+#define DECIMAL(name, type, bits) \
+  uint32_t name##_decimal(type a, type v, uint8_t c) { \
+    uint8_t ov; \
+    type r = name##_full(a, v, &c, &ov); \
+    return r | (uint32_t)c << (bits) | (uint32_t)ov << ((bits) + 1); \
+  }
+DECIMAL(adc8, uint8_t, 8)
+DECIMAL(adc16, uint16_t, 16)
+DECIMAL(sbc8, uint8_t, 8)
+DECIMAL(sbc16, uint16_t, 16)
