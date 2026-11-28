@@ -15,6 +15,8 @@ void render_set_view(int top, int lines);
 void render_frame(void);
 // Waits until the frame drawn last has been on screen for `frames` VBlanks.
 void render_hold(int frames);
+// VBlanks since the start.
+uint32_t render_vblank_count(void);
 // Cycles spent drawing, and waiting for the last frame to be shown.
 extern uint32_t g_render_cycles, g_idle_cycles;
 // From the VBlank interrupt.

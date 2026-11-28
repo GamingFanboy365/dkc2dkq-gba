@@ -78,17 +78,46 @@ static void choose_view(void) {
   render_set_view(top, LEVEL_LINES);
 }
 
+// Pacing and frame skipping. The game's frame n is due at VBlank n, 60 a
+// second: the game never runs faster than on the SNES, and when it's more
+// than a frame late, its picture isn't drawn (the game runs on at its own
+// speed, the picture at no less than half of it: never more than
+// MAX_SKIPPED in a row). A frame far behind (a slow one, loading) starts the
+// count again rather than racing to catch up.
+#define MAX_SKIPPED 1
+#define MAX_BEHIND 4
+EWRAM_DATA static uint32_t g_due_base, g_due;
+EWRAM_DATA static int g_skipped;
+
+static bool frame_due_drawn(bool must_draw) {
+  uint32_t now = render_vblank_count() - g_due_base, due = g_due++;
+  if (now > due + MAX_BEHIND) {
+    g_due_base = render_vblank_count();
+    g_due = 1;
+    now = due = 0;
+  }
+  if (!must_draw && now > due + 1 && g_skipped < MAX_SKIPPED) {
+    g_skipped++;
+    return false;
+  }
+  g_skipped = 0;
+  return true;
+}
+
 uint16_t on_wait(uint32_t wai_pc) {
   choose_view();
-  render_frame();
+  bool shot = false;
+#ifdef SHOT_LOG
+  static const int kShots[] = {SHOT_LOG};
+  for (unsigned i = 0; i < sizeof(kShots) / sizeof(kShots[0]); i++) shot |= kShots[i] == g_waits;
+#endif
+  if (frame_due_drawn(shot)) render_frame();
 #ifdef SHOT_LOG
   // gbarun -t takes the picture in the frame after this one: keep it there.
-  static const int kShots[] = {SHOT_LOG};
-  for (unsigned i = 0; i < sizeof(kShots) / sizeof(kShots[0]); i++)
-    if (kShots[i] == g_waits) {
-      debug_printf("shot %d", g_waits);
-      render_hold(2);
-    }
+  if (shot) {
+    debug_printf("shot %d", g_waits);
+    render_hold(2);
+  }
 #endif
 #ifdef SYNC_LOG
   debug_printf("sync %d %08x %06x", g_frame, sync_hash(g_wram), wai_pc);
@@ -148,7 +177,7 @@ int main(void) {
   REG_IE = 1;
   REG_IME = 1;
   game_reset();
-  uint32_t total = 0, worst = 0;
+  uint32_t total = 0, worst = 0, window_vblanks = render_vblank_count();
   int in_window = 0;
   for (g_frame = 0;; g_frame++) {
     uint32_t t0 = cycles_now();
@@ -166,9 +195,12 @@ int main(void) {
       // waiting for VBlank.
 #define MEAN60(t) (((t) >> 6) + ((t) >> 10) + ((t) >> 14))
       uint32_t logic = total - g_render_cycles - g_idle_cycles;
+      // The game's speed: its 60 frames against the VBlanks they took.
+      uint32_t vb = render_vblank_count(), took = vb - window_vblanks;
+      window_vblanks = vb;
       debug_printf("frames %d-%d: logic %u, drawing %u, idle %u cycles a frame; slowest frame %u "
-                   "(a GBA frame is 280896)", g_frame - 59, g_frame, MEAN60(logic),
-                   MEAN60(g_render_cycles), MEAN60(g_idle_cycles), worst);
+                   "(a GBA frame is 280896); in %u VBlanks (60: full speed)", g_frame - 59, g_frame,
+                   MEAN60(logic), MEAN60(g_render_cycles), MEAN60(g_idle_cycles), worst, took);
       total = worst = 0;
       g_render_cycles = g_idle_cycles = 0;
       in_window = 0;

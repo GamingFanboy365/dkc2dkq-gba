@@ -58,6 +58,15 @@ code or a cartridge.
 
 ## Speed
 
+The game's frame is the SNES's sixtieth of a second, so the frame rate is
+its speed: to play at full speed a frame must take no more than one of the
+GBA's (280,896 cycles). It's paced to the GBA's 60 frames a second (never
+faster), and when it's late a frame's picture is skipped, never two in a
+row (`gba/main.c`): the game runs as fast as its logic allows, the picture
+at half that or more. The cartridge's timing lines say how many VBlanks
+each 60 of the game's frames took (60: full speed); Pirate Panic takes
+about 100, 60% of full speed.
+
 GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 
 | | Logic | Drawing | Together |

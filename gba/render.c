@@ -1277,6 +1277,8 @@ static inline void set_window(const uint16_t *r) {
   REG16(0x0400004a) = (uint16_t)(0x1f | ((r[3] >> 7) & 1) << 5);
 }
 
+uint32_t render_vblank_count(void) { return g_vblanks; }
+
 void render_hold(int frames) {
   while (g_pending >= 0) {}
   uint32_t v = g_vblanks;
