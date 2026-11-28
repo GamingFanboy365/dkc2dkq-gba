@@ -362,6 +362,26 @@ HOT_CODE static void fast_oam_dma(const uint8_t *src, uint32_t size) {
   // The port's state in locals for the run (g_hw is in the GBA's EWRAM).
   uint8_t adr = g_hw.oam_adr, high = g_hw.oam_in_high, second = g_hw.oam_second_write, buffer = g_hw.oam_buffer;
   uint8_t val = 0;
+  if (!high && !second && size >= 2) {
+    // The usual: whole words into the main table, 32 bits at a time where
+    // both sides allow it.
+    uint32_t n = size >> 1, room = 256u - adr;
+    if (n > room) n = room;
+    uint16_t *dst = &g_hw.oam[adr];
+    uint32_t i = 0;
+    if (!(((uintptr_t)src | (uintptr_t)dst) & 3)) {
+      const uint32_t *s32 = (const uint32_t *)src;
+      uint32_t *d32 = (uint32_t *)dst;
+      for (; i + 2 <= n; i += 2) *d32++ = *s32++;
+    }
+    for (; i < n; i++) dst[i] = (uint16_t)(src[2 * i] | src[2 * i + 1] << 8);
+    buffer = src[2 * n - 2];
+    val = src[2 * n - 1];
+    src += 2 * n;
+    size -= 2 * n;
+    adr = (uint8_t)(adr + n);
+    if (n == room) high = 1;
+  }
   for (; size; size--) {
     if (!high && !second && size >= 2) {
       // A whole word of the main table

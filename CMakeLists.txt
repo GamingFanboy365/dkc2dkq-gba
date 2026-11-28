@@ -93,7 +93,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   set_source_files_properties(${GEN}/bank_B8.c PROPERTIES COMPILE_OPTIONS "-w;-marm")
   # What the recompiled code calls into, ARM too, so the memory map's inline
   # functions inline everywhere (their hot parts are in IWRAM).
-  set_source_files_properties(src/snes_hw.c src/runtime.c gba/render.c PROPERTIES COMPILE_OPTIONS "-marm")
+  set_source_files_properties(src/snes_hw.c gba/render.c PROPERTIES COMPILE_OPTIONS "-marm")
   target_link_options(dkc2.elf PRIVATE -T ${CMAKE_SOURCE_DIR}/gba/gba.ld -Wl,-Map=${CMAKE_BINARY_DIR}/dkc2.map)
   set_target_properties(dkc2.elf PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/gba/gba.ld)
   add_custom_command(

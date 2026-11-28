@@ -14,6 +14,7 @@ uint32_t R_80e580_recomp(uint32_t entry);
 uint32_t R_b5a8da_recomp(uint32_t entry);
 uint32_t R_b5f5e1_recomp(uint32_t entry);
 uint32_t R_bb8000_recomp(uint32_t entry);
+uint32_t R_8088ba_recomp(uint32_t entry);
 
 // The direct page (D = 0, bank 0), absolute with DB = $B5, long. Always
 // inline: each is a handful of instructions once its bank is folded.
@@ -385,6 +386,33 @@ uint32_t R_80e580(uint32_t entry) {
   cpu.z = 0;
   uint16_t r = pull16();
   return (uint32_t)cpu.pb << 16 | (uint16_t)(r + 1);
+}
+
+// ---- set_unused_oam_offscreen ($8088BA): the OAM slots from $70 on off screen ----
+//
+// PHK; PLB; then $F0FF (X 255, Y 240) into each slot's first word from X =
+// [$70] to $400, by 4; RTS. Every frame, 100-odd slots.
+
+uint32_t R_8088ba(uint32_t entry) {
+  if (entry != 0x8088ba || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf) return R_8088ba_recomp(entry);
+  uint16_t x = d16(0x70);
+  if (x > 0x400 || (x & 3)) return R_8088ba_recomp(entry);   // (never: the loop would run on)
+  push8(cpu.pb);
+  cpu.db = pull8();
+  if (x != 0x400) {
+    cpu.a = 0xf0ff;
+#ifdef WRAM_DIRECT
+    for (; x != 0x400; x += 4) *(uint16_t *)&g_wram[x] = 0xf0ff;   // (g_wram is 4-byte aligned)
+#else
+    for (; x != 0x400; x += 4) s16(x, 0xf0ff);
+#endif
+  }
+  cpu.x = 0x400;
+  cpu.n = 0;   // CPX #$0400, equal
+  cpu.z = 1;
+  cpu.c = 1;
+  uint16_t r = pull16();
+  return PBA((uint16_t)(r + 1));
 }
 
 // ---- CODE_B5A8DA: sprite_render_table sorted by the objects' $14 ----

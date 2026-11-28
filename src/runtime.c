@@ -33,8 +33,31 @@ RegionFn lookup_entry(uint32_t pc) {
   return lo < g_num_entries && g_entry_pcs[lo] == key ? g_entry_fns[lo] : 0;
 }
 
-uint32_t dispatch(uint32_t pc) {
+// The dispatcher's recent targets: the few the game jumps between regions
+// to each frame, without the search (from ROM, it's hundreds of cycles).
+#ifndef EWRAM_DATA
+#define EWRAM_DATA
+#endif
+#define ENTRY_CACHE 32
+EWRAM_DATA static struct { uint32_t pc; RegionFn fn; } g_entry_cache[ENTRY_CACHE];
+
+static inline RegionFn cached_entry(uint32_t pc) {
+  uint32_t i = (pc ^ pc >> 5 ^ pc >> 13) & (ENTRY_CACHE - 1);
+  if (g_entry_cache[i].pc == pc && g_entry_cache[i].fn) return g_entry_cache[i].fn;
   RegionFn fn = lookup_entry(pc);
+  if (fn) {
+    g_entry_cache[i].pc = pc;
+    g_entry_cache[i].fn = fn;
+  }
+  return fn;
+}
+
+#ifndef WARM_CODE
+#define WARM_CODE
+#endif
+// (In fast memory on the GBA: from ROM, a lookup was ~350 cycles.)
+WARM_CODE uint32_t dispatch(uint32_t pc) {
+  RegionFn fn = cached_entry(pc);
   if (!fn) {
     unknown_entry(pc);
     return PC_STOP | pc;
