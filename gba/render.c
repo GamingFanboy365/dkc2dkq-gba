@@ -635,21 +635,28 @@ IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
   bool maybe_hires = b == 0 && bpp == 4 && g_any_mode5;
   g_visible_rows[b] = 0;
   int last_row = -1, last_window = -1, last_g = 0;
-  for (int gy = 0; gy < LINES; gy++) {
+  const uint16_t *hofs_b = g_hofs[b], *vofs_b = g_vofs[b];
+  uint16_t *out = &f->scroll[1][b * 2];   // this BG's HOFS, VOFS for each line
+  int vbase = 0;                          // last_g * 8 - gy: the VOFS that shows its row
+  for (int gy = 0; gy < LINES; gy++, out += 8, vbase--) {
     int sy = g_src_line[gy];
-    uint32_t hofs = g_hofs[b][sy], vofs = g_vofs[b][sy];
+    uint32_t hofs = hofs_b[sy], vofs = vofs_b[sy];
     uint32_t bgy = sy + vofs + 1;
     uint32_t row = (bgy >> 3) & row_mask;
     uint32_t col0 = (hofs + CROP_X) >> 3;
     // BG1 on a Mode 5 line: its 16-pixel tiles, halved (the HIRES_POOL).
-    bool hires = maybe_hires && (g_line_mode[sy] & 7) == 5;
-    // A map 32 tiles wide fits a GBA row whole: any scroll shows it (one
-    // window); a wider one, the 31 columns from col0.
-    uint8_t window = (uint8_t)((wide ? col0 & col_mask : 0) | (uint32_t)hires << 7);
+    bool hires = false;
+    uint8_t window = 0;
+    if (wide | maybe_hires) {
+      hires = maybe_hires && (g_line_mode[sy] & 7) == 5;
+      // A map 32 tiles wide fits a GBA row whole: any scroll shows it (one
+      // window); a wider one, the 31 columns from col0.
+      window = (uint8_t)((wide ? col0 & col_mask : 0) | (uint32_t)hires << 7);
+    }
     if ((int)row == last_row && window == last_window) {
       // As the line before: the same GBA row.
-      f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
-      f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((last_g * 8 + (bgy & 7) - gy) & 0x1ff);
+      out[0] = (uint16_t)((hofs + CROP_X) & 0x1ff);
+      out[1] = (uint16_t)((vbase + (bgy & 7)) & 0x1ff);
       continue;
     }
     last_row = (int)row;
@@ -694,8 +701,9 @@ IWRAM_CODE static void draw_bg(int b, int bpp, bool main_screen, Frame *f) {
     }
   drawn:
     last_g = g;
-    f->scroll[gy + 1][b * 2] = (uint16_t)((hofs + CROP_X) & 0x1ff);
-    f->scroll[gy + 1][b * 2 + 1] = (uint16_t)((g * 8 + (bgy & 7) - gy) & 0x1ff);
+    vbase = g * 8 - gy;
+    out[0] = (uint16_t)((hofs + CROP_X) & 0x1ff);
+    out[1] = (uint16_t)((vbase + (bgy & 7)) & 0x1ff);
   }
 }
 
@@ -1022,8 +1030,12 @@ IWRAM_CODE void render_frame(void) {
 
   // The mode: the middle line's.
   uint8_t inidisp = g_hw.regs[0x00], mode = g_line_mode[g_src_line[LINES / 2]] & 7;
+  // (g_lines_unchanging: the HDMA left the lines' layers, color math, window
+  // and mode as line 0's; only scroll and the fixed color vary.)
   g_any_mode5 = false;
-  for (int gy = 0; gy < LINES; gy++) g_any_mode5 |= (g_line_mode[g_src_line[gy]] & 7) == 5;
+  if (g_lines_unchanging) g_any_mode5 = (g_line_mode[0] & 7) == 5;
+  else
+    for (int gy = 0; gy < LINES; gy++) g_any_mode5 |= (g_line_mode[g_src_line[gy]] & 7) == 5;
 
   // VRAM's changes since the last frame, into the cached tiles (or Mode 7's).
   bool m7_changed = false;
@@ -1072,6 +1084,11 @@ IWRAM_CODE void render_frame(void) {
     main_any |= g_line_tm[sy];
     if (math && (cgwsel & 2)) sub_any |= g_line_ts[sy] & ~g_line_tm[sy];
     if (math && g_fixed_line[sy]) plane = true;
+    if (g_lines_unchanging) {   // the rest as this line, but the fixed color
+      if (math && !plane)
+        for (int y = gy + 1; y < LINES && !plane; y++) plane = g_fixed_line[g_src_line[y]] != 0;
+      break;
+    }
   }
   main_any &= mode == 3 ? 0x13 : 0x17;
   sub_any &= mode == 3 ? 0x03 : 0x07;
@@ -1091,7 +1108,9 @@ IWRAM_CODE void render_frame(void) {
   }
   f->per_line_regs = false;
   uint32_t last_state = 0xffffffff, last_win = 0xffffffff;
-  for (int gy = 0; gy < LINES; gy++) {
+  // Every line's (for the HBlank interrupt), or, all the same, line 0's.
+  int reg_lines = g_lines_unchanging ? 1 : LINES;
+  for (int gy = 0; gy < reg_lines; gy++) {
     int sy = g_src_line[gy];
     uint32_t state = (uint32_t)g_line_tm[sy] | g_line_ts[sy] << 8 | g_line_cgwsel[sy] << 16 |
                      (uint32_t)g_line_cgadsub[sy] << 24;
@@ -1225,7 +1244,15 @@ IWRAM_CODE void render_frame(void) {
   f->per_line_fixed = false;
   f->bgcnt[3] = (uint16_t)(3 | 3 << 2 | PLANE_SCREENBLOCK << 8);
   if (plane) {
-    for (int gy = 0; gy < LINES; gy++) f->fixed[gy + 1] = scale_color(g_fixed_line[g_src_line[gy]], bright);
+    uint16_t last_in = 0, last_out = scale_color(0, bright);
+    for (int gy = 0; gy < LINES; gy++) {
+      uint16_t c = g_fixed_line[g_src_line[gy]];
+      if (c != last_in) {
+        last_in = c;
+        last_out = scale_color(c, bright);
+      }
+      f->fixed[gy + 1] = last_out;
+    }
     f->fixed[0] = f->fixed[1];
     for (int gy = 1; gy < LINES; gy++)
       if (f->fixed[gy + 1] != f->fixed[1]) { f->per_line_fixed = true; break; }
