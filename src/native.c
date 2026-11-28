@@ -15,18 +15,44 @@ uint32_t R_b5a8da_recomp(uint32_t entry);
 uint32_t R_b5f5e1_recomp(uint32_t entry);
 uint32_t R_bb8000_recomp(uint32_t entry);
 
-// The direct page (D = 0, bank 0), absolute with DB = $B5, long.
-static inline uint8_t d8(uint16_t a) { return rd8_b0(a); }
-static inline uint16_t d16(uint16_t a) { return rd16_b0(a); }
-static inline void s8(uint16_t a, uint8_t v) { wr8_b0(a, v); }
-static inline void s16(uint16_t a, uint16_t v) { wr16_b0(a, v); }
-static inline uint16_t b16(uint32_t a) { return rd16(0xb50000 + a); }
-static inline void bs16(uint32_t a, uint16_t v) { wr16(0xb50000 + a, v); }
+// The direct page (D = 0, bank 0), absolute with DB = $B5, long. Always
+// inline: each is a handful of instructions once its bank is folded.
+#define AI static inline __attribute__((always_inline))
+AI uint8_t d8(uint16_t a) { return rd8_b0(a); }
+AI uint16_t d16(uint16_t a) { return rd16_b0(a); }
+AI void s8(uint16_t a, uint8_t v) { wr8_b0(a, v); }
+AI void s16(uint16_t a, uint16_t v) { wr16_b0(a, v); }
+// (rd*_lx/wr*_lx: the bank a constant, the offset's range tested once.)
+AI uint16_t b16(uint32_t a) { return a < 0x10000 ? rd16_lx(0xb50000, (uint16_t)a) : rd16(0xb50000 + a); }
+AI void bs16(uint32_t a, uint16_t v) {
+  if (a < 0x10000) wr16_lx(0xb50000, (uint16_t)a, v);
+  else wr16(0xb50000 + a, v);
+}
+
+// $2180, WRAM's port, where the platform keeps WRAM itself: straight there.
+#ifdef WRAM_DIRECT
+#include "snes_hw.h"
+static inline void wram_port(uint8_t v) {
+  g_wram[g_hw.wram_adr] = v;
+  g_hw.wram_adr = (g_hw.wram_adr + 1) & 0x1ffff;
+}
+#else
+static inline void wram_port(uint8_t v) { wr8(0xb52180, v); }
+#endif
+
+// Absolute with a DB known only when running: straight to WRAM where DB
+// is a bank that has it below $2000 (00-3F, 80-BF, 7E).
+AI uint16_t db16(uint8_t db, uint16_t a) {
+#ifdef WRAM_DIRECT
+  if ((!(db & 0x40) || db == 0x7e) && a < 0x1fff) return g_wram[a] | g_wram[a + 1] << 8;
+#endif
+  return rd16((uint32_t)db << 16 | a);
+}
 
 // [dp],y
-static inline uint32_t ptr24(uint16_t dp) { return d16(dp) | (uint32_t)d8((uint16_t)(dp + 2)) << 16; }
-static inline uint8_t ind8(uint32_t p, uint16_t y) { return rd8((p + y) & 0xffffff); }
-static inline uint16_t ind16(uint32_t p, uint16_t y) { return ind8(p, y) | ind8(p, (uint16_t)(y + 1)) << 8; }
+AI uint32_t ptr24(uint16_t dp) { return d16(dp) | (uint32_t)d8((uint16_t)(dp + 2)) << 16; }
+AI uint8_t ind8(uint32_t p, uint16_t y) { return rd8((p + y) & 0xffffff); }
+AI uint16_t ind16(uint32_t p, uint16_t y) { return ind8(p, y) | ind8(p, (uint16_t)(y + 1)) << 8; }
 
 // ($56): DB = $B5.
 static inline void ora_56(uint8_t m) {
@@ -290,8 +316,11 @@ uint32_t R_b59f40(uint32_t entry) {
 // the camera: three bytes of speeds, 17 runs of 8 scroll words stepping by
 // a slope, then counters in the table bumped by the frame.
 
-static inline uint16_t w16(uint32_t a) { return rd16(0x7e0000 + a); }
-static inline void ws16(uint32_t a, uint16_t v) { wr16(0x7e0000 + a, v); }
+AI uint16_t w16(uint32_t a) { return a < 0x10000 ? rd16_lx(0x7e0000, (uint16_t)a) : rd16(0x7e0000 + a); }
+AI void ws16(uint32_t a, uint16_t v) {
+  if (a < 0x10000) wr16_lx(0x7e0000, (uint16_t)a, v);
+  else wr16(0x7e0000 + a, v);
+}
 
 uint32_t R_80e580(uint32_t entry) {
   if (entry != 0x80e580 || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf) return R_80e580_recomp(entry);
@@ -366,12 +395,14 @@ uint32_t R_80e580(uint32_t entry) {
 uint32_t R_b5a8da(uint32_t entry) {
   if (entry != 0xb5a8da || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf) return R_b5a8da_recomp(entry);
   uint32_t db = (uint32_t)cpu.db << 16;
-  uint16_t y = rd16(db | 0x16fe), a = rd16(db + 0x14 + y);
+  uint8_t dbk = cpu.db;
+  #define KEY(y) ((uint32_t)0x14 + (y) < 0x10000 ? db16(dbk, (uint16_t)(0x14 + (y))) : rd16(db + 0x14 + (y)))
+  uint16_t y = db16(dbk, 0x16fe), a = KEY(y);
   s16(0x54, a);
   uint16_t x = 0x16fc;
   do {
     y = d16((uint16_t)(0x04 + x));
-    a = rd16(db + 0x14 + y);
+    a = KEY(y);
     uint16_t last = d16(0x54);
     s16(0x54, a);
     if (a > last) {
@@ -383,7 +414,7 @@ uint32_t R_b5a8da(uint32_t entry) {
   } while (x != 0x172c);
   do {
     y = d16(x);
-    a = rd16(db + 0x14 + y);
+    a = KEY(y);
     uint16_t last = d16(0x54);
     s16(0x54, a);
     if (a < last) {
@@ -542,8 +573,8 @@ uint32_t R_b5f5e1(uint32_t entry) {
         c = 0;
         uint16_t w = adc16v(d16(0x3c), b16(0xfb66 + y), &c, &v);
         c = 1;   // SEP #$21
-        wr8(0xb52180, (uint8_t)w);
-        wr8(0xb52180, adc8v(d8(0x3e), rd8(tbl + x), &c, &v));
+        wram_port((uint8_t)w);
+        wram_port(adc8v(d8(0x3e), rd8(tbl + x), &c, &v));
         uint8_t t = rd8(tbl + x);
         c = (t >> 1) & 1;
         t >>= 2;
@@ -551,8 +582,8 @@ uint32_t R_b5f5e1(uint32_t entry) {
         t &= 0x0e;
         t = adc8v(t, d8(0x42), &c, &v);
         t &= 0xee;
-        wr8(0xb52180, t);
-        wr8(0xb52180, d8(0x43));
+        wram_port(t);
+        wram_port(d8(0x43));
         // XBA; ASL: the X position's ninth bit; into $4A with a size bit
         c = (w >> 15) & 1;
         uint8_t q = d8(0x4a);
