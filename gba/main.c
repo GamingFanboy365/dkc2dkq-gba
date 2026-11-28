@@ -21,8 +21,29 @@ static uint16_t read_joypad(void);
 
 volatile uint8_t g_lag_event, g_frame_vblanks;
 
-void irq_handler(void) {
+#ifdef SAMPLE_PROFILE
+// A statistical profile: timer 0 interrupts every 16411 cycles through the
+// SAMPLE_FRAMES game frames from SAMPLE_PROFILE, and each interrupt prints the
+// PC it stopped (tools/sample_report.py sums them by function). Unlike
+// gbarun's PROFILE, which samples when mGBA processes events, these are
+// evenly spread in time.
+#define SAMPLE_FRAMES 600
+static bool g_sampling;
+static void sample_start(void) {
+  REG16(0x04000100) = (uint16_t)(65536 - 16411);
+  REG16(0x04000102) = 0xc0;   // enabled, interrupts, every cycle
+  REG_IE |= 8;
+  g_sampling = true;
+}
+#endif
+
+void irq_handler(uint32_t return_pc) {
   uint16_t flags = REG_IF;
+#ifdef SAMPLE_PROFILE
+  if ((flags & 8) && g_sampling) debug_print_sample(return_pc - 4);
+#else
+  (void)return_pc;
+#endif
   if (flags & 2) render_hblank();
   if (flags & 1) {
     render_vblank();
@@ -104,7 +125,24 @@ static bool frame_due_drawn(bool must_draw) {
   return true;
 }
 
+// The stack grows down toward IWRAM's data: guard words just past the data,
+// checked every frame, so running out is reported rather than silently
+// corrupting the variables below.
+#define STACK_GUARD 0x57ac57acu
+extern uint32_t __bss_end[];
+static void stack_guard_set(void) {
+  for (int i = 0; i < 4; i++) __bss_end[i] = STACK_GUARD;
+}
+static void stack_guard_check(void) {
+  for (int i = 0; i < 4; i++)
+    if (__bss_end[i] != STACK_GUARD) {
+      debug_printf("frame %d: the stack ran into IWRAM's data", g_frame);
+      for (;;) {}
+    }
+}
+
 uint16_t on_wait(uint32_t wai_pc) {
+  stack_guard_check();
   choose_view();
   bool shot = false;
 #ifdef SHOT_LOG
@@ -176,10 +214,15 @@ int main(void) {
   REG_DISPSTAT = 1 << 3;   // VBlank interrupt
   REG_IE = 1;
   REG_IME = 1;
+  stack_guard_set();
   game_reset();
   uint32_t total = 0, worst = 0, window_vblanks = render_vblank_count();
   int in_window = 0;
   for (g_frame = 0;; g_frame++) {
+#ifdef SAMPLE_PROFILE
+    if (g_frame == SAMPLE_PROFILE) sample_start();
+    if (g_frame == SAMPLE_PROFILE + SAMPLE_FRAMES) g_sampling = false;
+#endif
     uint32_t t0 = cycles_now();
     bool ok = game_frame();
     uint32_t t = cycles_now() - t0;

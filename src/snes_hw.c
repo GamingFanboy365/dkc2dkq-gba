@@ -478,14 +478,23 @@ void hw_hdma_begin(void) {
 
 // The same as hw_hdma_begin and 224 hw_hdma_line calls, on a copy of the
 // active channels' state in fast memory (g_hw is in the GBA's EWRAM).
-bool g_hdma_wrote;
+uint8_t g_hdma_wrote;
+
+// What a write to B-bus address adr is, for g_hdma_wrote.
+static uint8_t hdma_wrote_kind(uint8_t adr) {
+  if (adr >= 0x0d && adr <= 0x14) return HDMA_WROTE_SCROLL;
+  if (adr == 0x32) return HDMA_WROTE_FIXED;
+  if (adr == 0x2c || adr == 0x2d) return HDMA_WROTE_LAYERS;
+  if (adr == 0x21 || adr == 0x22) return HDMA_WROTE_CGRAM;
+  return HDMA_WROTE_OTHER;
+}
 
 HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
   hw_hdma_begin();
   struct {
     uint32_t table, indirect;
     uint8_t lines, do_transfer, active, c;
-    uint8_t mode, badr, ibank;
+    uint8_t mode, badr, ibank, kind;
     bool indirect_mode;
   } ch[8];
   int n = 0;
@@ -501,10 +510,13 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
     ch[n].indirect_mode = g_hw.dma[c][0] & 0x40;
     ch[n].badr = g_hw.dma[c][1];
     ch[n].ibank = g_hw.dma[c][7];
+    ch[n].kind = 0;
+    for (int i = 0; i < kTransferLength[ch[n].mode]; i++)
+      ch[n].kind |= hdma_wrote_kind((uint8_t)(ch[n].badr + kBAdrOffsets[ch[n].mode][i]));
     n++;
   }
   for (int line = 0; line < 224; line++) {
-    g_hdma_wrote = false;
+    g_hdma_wrote = 0;
     for (int k = 0; k < n; k++) {
       if (!ch[k].active) continue;
       bool indirect = ch[k].indirect_mode;
@@ -512,7 +524,7 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
       uint16_t t = (uint16_t)ch[k].table;
       if (ch[k].do_transfer) {
         uint8_t mode = ch[k].mode;
-        g_hdma_wrote = true;
+        g_hdma_wrote |= ch[k].kind;
         for (int i = 0; i < kTransferLength[mode]; i++) {
           uint8_t v;
           if (indirect) {
@@ -548,6 +560,155 @@ HOT_CODE void hw_hdma_frame(void (*after_line)(int line)) {
     g_hw.hdma[c].do_transfer = ch[k].do_transfer;
     g_hw.hdma[c].active = ch[k].active;
   }
+}
+
+// hw_hdma_frame for the frames whose channels all write, from direct tables
+// in WRAM or ROM, one of BG2-3's scroll registers twice (no two channels the
+// same one; BG1's also feeds Mode 7's latch) or COLDATA once (one channel):
+// channel by channel, each line's value of the registers into the arrays
+// (BG1-3's scroll, and COLDATA as r | g << 5 | b << 10; those no channel
+// writes, the same on every line). What it leaves in g_hw is what
+// hw_hdma_frame would. For any other frame, false, g_hw untouched (the
+// arrays may not be).
+WARM_CODE bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], uint16_t *fixed) {
+  if (g_ppu_write_hook) return false;
+  struct {
+    uint32_t bank;
+    uint16_t t;
+    uint16_t cur;   // its register's value at the end
+    uint8_t lines, do_transfer, active, c, badr, v;
+    int last;   // line * 8 + channel of its last write, or -1
+  } ch[8];
+  int n = 0, nfixed = 0;
+  uint32_t regs_seen = 0;
+  for (int c = 0; c < 8; c++) {
+    if (!((g_hw.hdmaen >> c) & 1)) continue;
+    const uint8_t *r = g_hw.dma[c];
+    uint8_t mode = r[0] & 7, badr = r[1];
+    if (r[0] & 0x40) return false;   // indirect
+    if (mode == 2 && badr >= 0x0f && badr <= 0x12) {   // BG2-3's
+      if (regs_seen & (1u << badr)) return false;
+      regs_seen |= 1u << badr;
+    } else if (mode == 0 && badr == 0x32) {
+      if (nfixed++) return false;
+    } else {
+      return false;
+    }
+    ch[n].bank = r[4];
+    ch[n].t = (uint16_t)(r[2] | r[3] << 8);
+    ch[n].c = (uint8_t)c;
+    ch[n].badr = badr;
+    ch[n].last = -1;
+    n++;
+  }
+  // What no channel writes, as at the start.
+  uint16_t fixed_now = (uint16_t)(g_hw.fixed_r | g_hw.fixed_g << 5 | g_hw.fixed_b << 10);
+  for (int i = 0; i < 3; i++) {
+    uint16_t h = g_hw.hofs[i], v = g_hw.vofs[i];
+    if (!(regs_seen & (1u << (0x0d + 2 * i))))
+      for (int line = 0; line < 224; line++) hofs[i][line] = h;
+    if (!(regs_seen & (1u << (0x0e + 2 * i))))
+      for (int line = 0; line < 224; line++) vofs[i][line] = v;
+  }
+  if (!nfixed)
+    for (int line = 0; line < 224; line++) fixed[line] = fixed_now;
+  // Each channel's lines: a transfer on the lines that have one; on the
+  // others (a table entry's after its first, without its repeat bit) only
+  // the count goes down, so those are done together.
+  for (int k = 0; k < n; k++) {
+    uint32_t bank = ch[k].bank, lo = 0;
+    const uint8_t *tb;
+    if ((bank & 0xfe) == 0x7e) tb = g_wram + ((bank & 1) << 16);
+    else {
+      tb = g_rom + ((bank & 0x3f) << 16);
+      if (!(bank & 0x40)) lo = 0x8000;   // 00-3F, 80-BF: ROM from $8000
+    }
+    uint16_t t = ch[k].t;
+    if (t < lo) return false;
+    uint8_t lines = tb[t++], do_transfer = 1, active = lines != 0, badr = ch[k].badr, v = 0;
+    bool is_fixed = badr == 0x32;
+    uint16_t *out, cur;
+    if (is_fixed) {
+      out = fixed;
+      cur = fixed_now;
+    } else {
+      int i = (badr - 0x0d) >> 1;   // 1-2: BG2-3
+      cur = (badr & 1) ? g_hw.hofs[i] : g_hw.vofs[i];
+      out = (badr & 1) ? hofs[i] : vofs[i];
+    }
+    int line = 0;
+    while (line < 224) {
+      if (!active) {
+        for (; line < 224; line++) out[line] = cur;
+        break;
+      }
+      if (!do_transfer) {
+        // lines (1-127) lines without a transfer, the last reloading.
+        int m = 224 - line < lines ? 224 - line : lines;
+        for (int e = line + m; line < e; line++) out[line] = cur;
+        lines = (uint8_t)(lines - m);
+        if (lines) break;   // the frame ended first
+      } else {
+        if (t < lo || t == 0xffff) return false;   // t and t + 1 in the table's memory
+        if (is_fixed) {
+          v = tb[t++];
+          if (v & 0x20) cur = (uint16_t)((cur & ~0x001f) | (v & 0x1f));
+          if (v & 0x40) cur = (uint16_t)((cur & ~0x03e0) | (v & 0x1f) << 5);
+          if (v & 0x80) cur = (uint16_t)((cur & ~0x7c00) | (v & 0x1f) << 10);
+        } else {
+          v = tb[(uint16_t)(t + 1)];
+          cur = (uint16_t)((v << 8 | tb[t]) & 0x3ff);   // what the latches leave
+          t += 2;
+        }
+        ch[k].last = line * 8 + ch[k].c;
+        out[line++] = cur;
+        lines--;
+        do_transfer = lines >> 7;
+        if (lines & 0x7f) continue;
+      }
+      // The next entry.
+      if (t < lo) return false;
+      lines = tb[t++];
+      if (lines == 0) active = 0;
+      do_transfer = 1;
+    }
+    ch[k].t = t;
+    ch[k].lines = lines;
+    ch[k].do_transfer = do_transfer;
+    ch[k].active = active;
+    ch[k].v = v;
+    ch[k].cur = cur;
+  }
+  // Done: the registers as the last writes left them, and the channels.
+  int last_scroll = -1, last_hofs = -1;
+  for (int k = 0; k < n; k++) {
+    if (ch[k].last < 0) continue;
+    uint8_t badr = ch[k].badr, v = ch[k].v;
+    uint16_t cur = ch[k].cur;
+    g_hw.regs[badr] = v;
+    if (badr == 0x32) {
+      g_hw.fixed_r = cur & 0x1f;
+      g_hw.fixed_g = (cur >> 5) & 0x1f;
+      g_hw.fixed_b = cur >> 10;
+      continue;
+    }
+    if (badr & 1) g_hw.hofs[(badr - 0x0d) >> 1] = cur;
+    else g_hw.vofs[(badr - 0x0e) >> 1] = cur;
+    if (ch[k].last > last_scroll) { last_scroll = ch[k].last; g_hw.scroll_prev = v; }
+    if ((badr & 1) && ch[k].last > last_hofs) { last_hofs = ch[k].last; g_hw.scroll_prev2 = v; }
+  }
+  for (int c = 0; c < 8; c++) {
+    g_hw.hdma[c].active = 0;
+    g_hw.hdma[c].do_transfer = 0;
+  }
+  for (int k = 0; k < n; k++) {
+    int c = ch[k].c;
+    g_hw.hdma[c].table = ch[k].bank << 16 | ch[k].t;
+    g_hw.hdma[c].lines = ch[k].lines;
+    g_hw.hdma[c].do_transfer = ch[k].do_transfer;
+    g_hw.hdma[c].active = ch[k].active;
+  }
+  return true;
 }
 
 void hw_hdma_line(void) {   // (hostmini; the GBA runs hw_hdma_frame)

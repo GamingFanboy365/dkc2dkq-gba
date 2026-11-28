@@ -25,6 +25,9 @@
 #ifndef HOT_CODE
 #define HOT_CODE
 #endif
+#ifndef WARM_CODE
+#define WARM_CODE
+#endif
 
 typedef struct {
   uint16_t vram[0x8000];
@@ -85,8 +88,17 @@ void hw_hdma_line(void);
 // The same for a whole frame: begin, then the 224 lines, calling
 // after_line(line) after each line's transfers (NULL: none).
 void hw_hdma_frame(void (*after_line)(int line));
-// In hw_hdma_frame's after_line: whether HDMA wrote anything on that line.
-extern bool g_hdma_wrote;
+// In hw_hdma_frame's after_line: what HDMA wrote on that line (0: nothing).
+#define HDMA_WROTE_SCROLL 1   // BG1-4 HOFS/VOFS
+#define HDMA_WROTE_FIXED 2    // COLDATA
+#define HDMA_WROTE_LAYERS 4   // TM, TS
+#define HDMA_WROTE_CGRAM 8    // CGADD, CGDATA
+#define HDMA_WROTE_OTHER 0x80
+extern uint8_t g_hdma_wrote;
+// hw_hdma_frame for the simplest frames (only scroll and COLDATA writes),
+// channel by channel: the lines' BG1-3 scroll and fixed color (r | g << 5 |
+// b << 10) into the arrays. false for other frames, having done nothing.
+bool hw_hdma_frame_fast(uint16_t hofs[3][224], uint16_t vofs[3][224], uint16_t *fixed);
 extern void (*g_ppu_write_hook)(uint8_t reg, uint8_t value);
 // The start of VBlank: the NMI flag, and the joypads read (auto-joypad).
 void hw_vblank(uint16_t joy1);

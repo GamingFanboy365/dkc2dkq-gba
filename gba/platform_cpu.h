@@ -11,8 +11,10 @@
 
 #include "snes_mem.h"
 
-// Hot code goes to IWRAM as ARM.
+// Hot code goes to IWRAM as ARM; warm code there as Thumb (half the size,
+// a little slower).
 #define HOT_CODE __attribute__((section(".iwram"), target("arm"), noinline))
+#define WARM_CODE __attribute__((section(".iwram"), target("thumb"), noinline))
 
 extern volatile uint8_t g_lag_event;
 #define CYC(n) ((void)0)

@@ -324,7 +324,7 @@ IWRAM_CODE static void tile_changed(Pool *p, uint32_t tile) {
 #define M7_SCREENBLOCK 8
 static bool g_m7_shown;
 
-static void convert_mode7(void) {   // (rare: ROM)
+__attribute__((noinline)) static void convert_mode7(void) {   // (rare: ROM)
   volatile uint32_t *tiles = (volatile uint32_t *)0x06000000;
   volatile uint32_t *map = (volatile uint32_t *)(0x06000000 + M7_SCREENBLOCK * 0x800);
   const uint16_t *v = g_hw.vram;
@@ -336,7 +336,7 @@ static void convert_mode7(void) {   // (rare: ROM)
 }
 
 // Empties a pool's cache (its tiles change size); its cells are released.
-static void flush_pool(Pool *p) {
+__attribute__((noinline)) static void flush_pool(Pool *p) {
   for (uint32_t s = 0; s < NUM_SLOTS; s++)
     if (g_owner[s] && (uint32_t)((g_owner[s] - 1) >> 13) == p->id) g_owner[s] = 0;
   memset(p->slot_of, 0, sizeof(g_slot_of[0]));
@@ -369,7 +369,8 @@ EWRAM_DATA static uint32_t g_line_win[224];
 // Per SNES line, what HDMA may change besides the scroll: the main and
 // sub screens' layers, color math's settings, and up to MAX_LINE_COLORS
 // CGRAM entries (note_cgram_write).
-static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
+#define ALIGNED4 __attribute__((aligned(4)))   // (for memset's word stores)
+ALIGNED4 static uint8_t g_line_tm[224], g_line_ts[224], g_line_cgwsel[224], g_line_cgadsub[224];
 static uint8_t g_hdma_color[MAX_LINE_COLORS], g_num_hdma_colors;
 EWRAM_DATA static uint16_t g_line_color[224][MAX_LINE_COLORS];
 
@@ -381,7 +382,7 @@ static uint16_t g_cgram_ver_seen;
 static uint8_t g_prev_colors[MAX_LINE_COLORS], g_num_prev_colors;
 static uint16_t g_cgram_start[MAX_LINE_COLORS];
 
-static void note_cgram_write(int line) {
+__attribute__((noinline)) static void note_cgram_write(int line) {
   uint8_t c = (uint8_t)(g_hw.cgram_pointer - 1);
   for (int k = 0; k < g_num_hdma_colors; k++)
     if (g_hdma_color[k] == c) return;
@@ -394,7 +395,7 @@ static void note_cgram_write(int line) {
   for (int l = 0; l < line; l++) g_line_color[l][k] = before;
 }
 
-static uint8_t g_line_mode[224];   // BGMODE per SNES line
+ALIGNED4 static uint8_t g_line_mode[224];   // BGMODE per SNES line
 static bool g_any_mode5;           // a shown line in Mode 5 this frame
 
 // Mode 7: where SNES screen line `line`'s first pixel is in the 1024x1024
@@ -425,48 +426,84 @@ IWRAM_CODE static void capture_line(int line) {
     }
     return;
   }
+  // From g_hw what HDMA wrote since the last line captured (everything, if
+  // none was), the rest as that line.
   int p = g_last_captured;
   g_last_captured = line;
-  if (!g_hdma_wrote && p >= 0) {
-    // Nothing written since the last line captured: as it.
+  uint8_t w = p < 0 ? 0xff : g_hdma_wrote;
+  if (w & HDMA_WROTE_SCROLL) {
+    for (int b = 0; b < 3; b++) {
+      g_hofs[b][line] = g_hw.hofs[b];
+      g_vofs[b][line] = g_hw.vofs[b];
+    }
+  } else {
     for (int b = 0; b < 3; b++) {
       g_hofs[b][line] = g_hofs[b][p];
       g_vofs[b][line] = g_vofs[b][p];
     }
-    g_fixed_line[line] = g_fixed_line[p];
+  }
+  g_fixed_line[line] = (w & HDMA_WROTE_FIXED) ? (uint16_t)(g_hw.fixed_r | g_hw.fixed_g << 5 | g_hw.fixed_b << 10)
+                                              : g_fixed_line[p];
+  if (w & HDMA_WROTE_LAYERS) {
+    g_line_tm[line] = g_hw.regs[0x2c];
+    g_line_ts[line] = g_hw.regs[0x2d];
+  } else {
     g_line_tm[line] = g_line_tm[p];
     g_line_ts[line] = g_line_ts[p];
+  }
+  if (w & HDMA_WROTE_CGRAM) {
+    if ((uint16_t)(g_hw.cgram_ver - g_cgram_ver_seen) >= 2) note_cgram_write(line);
+    g_cgram_ver_seen = g_hw.cgram_ver;
+    for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_hw.cgram[g_hdma_color[k]];
+  } else {
+    for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_line_color[p][k];
+  }
+  if (w & HDMA_WROTE_OTHER) {
+    g_line_cgwsel[line] = g_hw.regs[0x30];
+    uint8_t wsel = g_hw.regs[0x25] >> 4;
+    if (wsel & 2)
+      g_line_win[line] = g_hw.regs[0x26] | g_hw.regs[0x27] << 8 | 1u << 16 | (uint32_t)(wsel & 1) << 17;
+    else if (wsel & 8)
+      g_line_win[line] = g_hw.regs[0x28] | g_hw.regs[0x29] << 8 | 1u << 16 | (uint32_t)(wsel & 4) << 15;
+    else
+      g_line_win[line] = 0;
+    g_line_cgadsub[line] = g_hw.regs[0x31];
+    g_line_mode[line] = g_hw.regs[0x05];
+  } else {
     g_line_cgwsel[line] = g_line_cgwsel[p];
     g_line_win[line] = g_line_win[p];
     g_line_cgadsub[line] = g_line_cgadsub[p];
-    for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_line_color[p][k];
     g_line_mode[line] = g_line_mode[p];
-    return;
   }
-  if ((uint16_t)(g_hw.cgram_ver - g_cgram_ver_seen) >= 2) note_cgram_write(line);
-  g_cgram_ver_seen = g_hw.cgram_ver;
-  for (int b = 0; b < 3; b++) {
-    g_hofs[b][line] = g_hw.hofs[b];
-    g_vofs[b][line] = g_hw.vofs[b];
-  }
-  g_fixed_line[line] = (uint16_t)(g_hw.fixed_r | g_hw.fixed_g << 5 | g_hw.fixed_b << 10);
-  g_line_tm[line] = g_hw.regs[0x2c];
-  g_line_ts[line] = g_hw.regs[0x2d];
-  g_line_cgwsel[line] = g_hw.regs[0x30];
-  uint8_t wsel = g_hw.regs[0x25] >> 4;
-  if (wsel & 2)
-    g_line_win[line] = g_hw.regs[0x26] | g_hw.regs[0x27] << 8 | 1u << 16 | (uint32_t)(wsel & 1) << 17;
-  else if (wsel & 8)
-    g_line_win[line] = g_hw.regs[0x28] | g_hw.regs[0x29] << 8 | 1u << 16 | (uint32_t)(wsel & 4) << 15;
-  else
-    g_line_win[line] = 0;
-  g_line_cgadsub[line] = g_hw.regs[0x31];
-  for (int k = 0; k < g_num_hdma_colors; k++) g_line_color[line][k] = g_hw.cgram[g_hdma_color[k]];
-  g_line_mode[line] = g_hw.regs[0x05];
+}
+
+// After hw_hdma_frame_fast, which wrote the lines' scroll and fixed color:
+// the rest, the same on every line.
+static bool g_lines_unchanging;   // whether capture_unchanging filled the arrays last
+
+__attribute__((noinline)) static void capture_unchanging(void) {
+  uint8_t tm = g_hw.regs[0x2c], ts = g_hw.regs[0x2d], cgwsel = g_hw.regs[0x30];
+  uint8_t cgadsub = g_hw.regs[0x31], mode = g_hw.regs[0x05], wsel = g_hw.regs[0x25] >> 4;
+  uint32_t win = 0;
+  if (wsel & 2) win = g_hw.regs[0x26] | g_hw.regs[0x27] << 8 | 1u << 16 | (uint32_t)(wsel & 1) << 17;
+  else if (wsel & 8) win = g_hw.regs[0x28] | g_hw.regs[0x29] << 8 | 1u << 16 | (uint32_t)(wsel & 4) << 15;
+  // Usually what the arrays hold already, from the last frame.
+  static uint32_t held[2];
+  uint32_t now[2] = {(uint32_t)(tm | ts << 8 | cgwsel << 16 | cgadsub << 24), win | (uint32_t)mode << 24};
+  if (g_lines_unchanging && now[0] == held[0] && now[1] == held[1]) return;
+  g_lines_unchanging = true;
+  held[0] = now[0];
+  held[1] = now[1];
+  memset(g_line_tm, tm, 224);
+  memset(g_line_ts, ts, 224);
+  memset(g_line_cgwsel, cgwsel, 224);
+  memset(g_line_cgadsub, cgadsub, 224);
+  memset(g_line_mode, mode, 224);
+  for (int line = 0; line < 224; line++) g_line_win[line] = win;
 }
 
 // The GBA palette entries showing SNES color c (render_frame's layout).
-static int gba_entries(int c, uint16_t *out) {
+__attribute__((noinline)) static int gba_entries(int c, uint16_t *out) {
   if (c >= 128) { out[0] = (uint16_t)(256 + c - 128); return 1; }
   out[0] = (uint16_t)c;
   if (c < 32) { out[1] = (uint16_t)((8 + c / 4) * 16 + c % 4); return 2; }
@@ -489,7 +526,7 @@ static inline bool map_words_changed(uint32_t w) {
 static Pool *bg_pool(int b) { return &g_pools[b]; }
 static Pool *cell_pool(int b, int i) { return cell_hires(b, i) ? &g_pools[HIRES_POOL] : &g_pools[b]; }
 
-static void clear_cells(int b) {
+__attribute__((noinline)) static void clear_cells(int b) {
   volatile uint16_t *map = SCREENBLOCK(FIRST_SCREENBLOCK + b);
   for (int g = 0; g < 32; g++) g_row_shown[b][g] = 0;
   for (int i = 0; i < 1024; i++) {
@@ -975,7 +1012,12 @@ IWRAM_CODE void render_frame(void) {
   g_num_hdma_colors = 0;
   g_cgram_ver_seen = g_hw.cgram_ver;
   g_last_captured = -1;
-  hw_hdma_frame(capture_line);
+  if (hw_hdma_frame_fast(g_hofs, g_vofs, g_fixed_line)) {
+    capture_unchanging();
+  } else {
+    g_lines_unchanging = false;
+    hw_hdma_frame(capture_line);
+  }
 
   // The mode: the middle line's.
   uint8_t inidisp = g_hw.regs[0x00], mode = g_line_mode[g_src_line[LINES / 2]] & 7;

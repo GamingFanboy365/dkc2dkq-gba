@@ -65,7 +65,7 @@ faster), and when it's late a frame's picture is skipped, never two in a
 row (`gba/main.c`): the game runs as fast as its logic allows, the picture
 at half that or more. The cartridge's timing lines say how many VBlanks
 each 60 of the game's frames took (60: full speed); Pirate Panic takes
-about 100, 60% of full speed.
+about 84, 70% of full speed.
 
 GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 
@@ -73,10 +73,12 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 |---|---|---|---|
 | First build | 1,530,000 | 920,000 | 2,450,000 (8.7 frames) |
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
-| Now | 293,000 | 276,000 | 569,000 (2.0 frames) |
+| Before HDMA by channel | 293,000 | 276,000 | 569,000 (2.0 frames) |
+| Now | 293,000 | 174,000 | 467,000 (1.7 frames) |
 
-(Measured over game frames 2340-2399 of the play session, in the level; an
-earlier "315,000 for drawing" was a quieter stretch.)
+(Measured over game frames 2340-2399 of the play session, in the level,
+with every frame drawn; an earlier "315,000 for drawing" was a quieter
+stretch.)
 
 What did it, measured with gbarun's sampling profiler (`PROFILE=`,
 `tools/profile_report.py`): the memory map inline, DMA to VRAM/OAM/CGRAM as
@@ -85,7 +87,10 @@ bigger functions, a page index for the dispatcher, no cycle counting on the
 GBA; in the renderer, map cells and tile slots rewritten only when what they
 show changes, VRAM's dirty bits, hot loops as ARM in IWRAM, a 32-column
 map's row drawn once whatever each line's scroll, HDMA run on a copy of
-its state in IWRAM, the recompiled code as Thumb (half the ROM fetches), and native C for
+its state in IWRAM, and, when its channels only scroll a layer or set the
+fixed color (the levels' parallax and gradients), run channel by channel
+straight into the renderer's line arrays (`hw_hdma_frame_fast`: 135,000
+cycles a frame down to 20,000), the recompiled code as Thumb (half the ROM fetches), and native C for
 the hottest routines (`src/native.c`: the objects' sprites into OAM, the
 levels' parallax tables, the sort of the objects by drawing order, the
 levels' tiled objects' sprites, and the decompressor, which loading and the
@@ -97,8 +102,11 @@ ROM, block moves copy by pointers, and a function tests its first entry
 before searching the others.
 What's left: the game's own logic (the recompiled code:
 about 60%: executing it, not its memory: it makes only ~5,000 WRAM
-accesses a frame, half in the direct page and stack), the map rows, HDMA. IWRAM (32 KB) and EWRAM (256 KB, half of
-it the SNES's WRAM) are nearly full.
+accesses a frame, half in the direct page and stack), the map rows, and
+HDMA on screens whose channels do more (Crocodile Isle's map, whose
+palette, layers and scroll change every line: still line by line). IWRAM (32 KB) and EWRAM (256 KB, half of
+it the SNES's WRAM) are nearly full; a guard word past IWRAM's data,
+checked every frame, reports the stack reaching it.
 
 ## Building and checking
 
@@ -128,7 +136,13 @@ You need clang/lld (18), cmake, Python 3, libpng, asar 1.9, and your ROM.
     gbarun -q -n 20000 build-gba/dkc2.gba     # prints cycles per frame
 
 With `-DDKC2_SYNC_LOG=ON` the cartridge prints a WRAM hash per frame
-(`sync FRAME HASH PC`), for `compare_sync.py`. `tools/mgba/README.md` builds
+(`sync FRAME HASH PC`), for `compare_sync.py`. With
+`-DDKC2_SAMPLE_PROFILE=FRAME` it samples its own PC from a timer interrupt
+over 600 game frames from FRAME, evenly in time (gbarun's `PROFILE=` samples
+when mGBA handles events, which over-counts the interrupt handlers):
+
+    gbarun -q -n 9000 build-gba/dkc2.gba > out.txt
+    tools/sample_report.py out.txt build-gba/dkc2.elf `tools/mgba/README.md` builds
 gbarun.
 
 ## Controls

@@ -50,13 +50,15 @@ start:
 4:  b       4b
 
 @ Interrupts: the BIOS has saved r0-r3, r12 and lr and is in IRQ mode, in
-@ ARM; irq_handler (C, Thumb) does the work.
+@ ARM; irq_handler (C, Thumb) does the work, given the interrupted PC + 4
+@ (IRQ mode's lr, which the BIOS saved last).
     .global irq_entry
 irq_entry:
     stmfd   sp!, {lr}
-    ldr     r0, =irq_handler
+    ldr     r0, [sp, #24]
+    ldr     r1, =irq_handler
     mov     lr, pc
-    bx      r0
+    bx      r1
     ldmfd   sp!, {lr}
     bx      lr
     .pool

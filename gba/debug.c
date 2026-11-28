@@ -24,6 +24,17 @@ void debug_print(const char *s) {
   REG_DEBUG_FLAGS = 3 | 0x100;  // "info"
 }
 
+// "S" and a number in hex, written straight to the registers: no buffer,
+// for interrupt handlers (the IRQ stack is 160 bytes).
+void debug_print_sample(uint32_t v) {
+  if (!g_debug) return;
+  REG_DEBUG_STRING[0] = 'S';
+  REG_DEBUG_STRING[1] = ' ';
+  for (int i = 0; i < 8; i++) REG_DEBUG_STRING[2 + i] = "0123456789abcdef"[(v >> (28 - 4 * i)) & 15];
+  REG_DEBUG_STRING[10] = 0;
+  REG_DEBUG_FLAGS = 3 | 0x100;
+}
+
 static char *put_unsigned(char *p, uint32_t v) {
   static const uint32_t kPow10[] = {1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1};
   bool started = false;

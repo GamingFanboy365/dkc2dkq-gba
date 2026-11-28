@@ -36,6 +36,7 @@ enum {
 // mGBA's debug output (gba/debug.c).
 void debug_init(void);
 void debug_print(const char *s);
+void debug_print_sample(uint32_t v);   // 'S' and v in hex, from interrupts
 // printf-like, with %d %u %x %08x %06x %s only.
 void debug_printf(const char *fmt, ...);
 
