@@ -57,9 +57,39 @@ AI uint16_t ind16(uint32_t p, uint16_t y) { return ind8(p, y) | ind8(p, (uint16_
 
 // ($56): DB = $B5.
 static inline void ora_56(uint8_t m) {
-  uint32_t a = 0xb50000 + d16(0x56);
+  uint16_t o = d16(0x56);
+#ifdef WRAM_DIRECT
+  if (o < 0x2000) { g_wram[o] |= m; return; }   // (the high table, in WRAM)
+#endif
+  uint32_t a = 0xb50000 + o;
   wr8(a, rd8(a) | m);
 }
+
+// A long pointer's bytes in ROM as a host pointer, for offsets below *lim
+// (where they stay in the pointer's bank's ROM); *lim 0 if it isn't ROM.
+static inline const uint8_t *rom_ptr(uint32_t p, uint32_t *lim) {
+  *lim = 0;
+#ifdef WRAM_DIRECT
+  uint32_t bank = p >> 16, lo = p & 0xffff;
+  if ((bank & 0xfe) == 0x7e || (!(bank & 0x40) && lo < 0x8000)) return 0;
+  *lim = 0x10000 - lo;
+  return g_rom + ((bank & 0x3f) << 16 | lo);
+#else
+  (void)p;
+  return 0;
+#endif
+}
+#define ROM8(q, lim, p, y) ((uint32_t)(y) < (lim) ? (q)[y] : ind8(p, y))
+
+// The OAM buffer's bytes ($0200-$03FF in bank 0): straight to WRAM.
+#ifdef WRAM_DIRECT
+#define OAM8(a, v) ((a) < 0x2000 ? (void)(g_wram[a] = (uint8_t)(v)) : s8(a, v))
+#define OAM16(a, v) ((a) < 0x1fff ? (void)(g_wram[a] = (uint8_t)(v), g_wram[(a) + 1] = (uint8_t)((v) >> 8)) \
+                                  : s16((uint16_t)(a), v))
+#else
+#define OAM8(a, v) s8(a, v)
+#define OAM16(a, v) s16(a, v)
+#endif
 
 // ---- CODE_B59F40: the objects' sprites into the OAM buffer ----
 //
@@ -74,7 +104,8 @@ static inline void ora_56(uint8_t m) {
 // 0: done (RTS); 1: OAM is full (the writer drops its return address and
 // leaves the whole routine). *y_out: Y at the end (the header's length).
 static int write_pieces(bool xflip, bool yflip, bool large, uint16_t *y_out) {
-  uint32_t p40 = ptr24(0x40), p44 = ptr24(0x44);
+  uint32_t p40 = ptr24(0x40), p44 = ptr24(0x44), lim40, lim44;
+  const uint8_t *q40 = rom_ptr(p40, &lim40), *q44 = rom_ptr(p44, &lim44);
   s16(0x36, ind16(p40, 0));
   s16(0x38, ind16(p40, 2));
   s16(0x3a, ind16(p40, 4));
@@ -100,15 +131,15 @@ static int write_pieces(bool xflip, bool yflip, bool large, uint16_t *y_out) {
     uint8_t n = (uint8_t)(d8(0x36) - 1);
     s8(0x36, n);
     if (n & 0x80) break;
-    uint8_t yb = ind8(p44, y);
+    uint8_t yb = ROM8(q44, lim44, p44, y);
     if (yflip) yb ^= 0xff;
     uint16_t v = (uint16_t)(yb + d16(0x74) + c);
     if (v < 0xf0) {
-      s16((uint16_t)(x + 1), (uint16_t)(v - 0x10));
-      uint8_t xb = ind8(p40, y);
+      OAM16(x + 1, (uint16_t)(v - 0x10));
+      uint8_t xb = ROM8(q40, lim40, p40, y);
       if (xflip) xb ^= 0xff;
       uint16_t xv = (uint16_t)(xb + d16(0x72));
-      s8(x, (uint8_t)xv);
+      OAM8(x, xv);
       uint8_t m = d8(0x3e);
       if (xv < 0x100) m &= 0xaa;
       ora_56(m);
@@ -120,7 +151,7 @@ static int write_pieces(bool xflip, bool yflip, bool large, uint16_t *y_out) {
         m = 3;
       }
       s8(0x3e, m);
-      s16((uint16_t)(x + 2), d16(0x34));
+      OAM16(x + 2, d16(0x34));
       x += 4;
     }
     // CLC; LDA $34; INC; INC; BIT #$10; BEQ; ADC #$10: the next 16x16 tile
@@ -151,15 +182,15 @@ static int write_pieces(bool xflip, bool yflip, bool large, uint16_t *y_out) {
       uint8_t n = (uint8_t)(d8(count) - 1);
       s8(count, n);
       if (n & 0x80) break;
-      uint8_t yb = ind8(p44, y);
+      uint8_t yb = ROM8(q44, lim44, p44, y);
       if (yflip) yb ^= 0xff;
       uint16_t v = (uint16_t)(yb + d16(0x74));
       if (v < 0xf0) {
-        s16((uint16_t)(x + 1), (uint16_t)(v - 0x10));
-        uint8_t xb = ind8(p40, y);
+        OAM16(x + 1, (uint16_t)(v - 0x10));
+        uint8_t xb = ROM8(q40, lim40, p40, y);
         if (xflip) xb ^= 0xff;
         uint16_t xv = (uint16_t)(xb + d16(0x72));
-        s8(x, (uint8_t)xv);
+        OAM8(x, xv);
         if (xv & 0x100) {
           s16(0x54, x);
           uint16_t xi2 = (x & 0x1fc) >> 2;
@@ -167,7 +198,7 @@ static int write_pieces(bool xflip, bool yflip, bool large, uint16_t *y_out) {
           ora_56(rd8(0xb5a194 + xi2));
           x = d16(0x54);
         }
-        s16((uint16_t)(x + 2), d16(0x34));
+        OAM16(x + 2, d16(0x34));
         x += 4;
       }
       s16(0x34, (uint16_t)(d16(0x34) + 1));
@@ -317,21 +348,25 @@ uint32_t R_b59f40(uint32_t entry) {
 // the camera: three bytes of speeds, 17 runs of 8 scroll words stepping by
 // a slope, then counters in the table bumped by the frame.
 
-AI uint16_t w16(uint32_t a) { return a < 0x10000 ? rd16_lx(0x7e0000, (uint16_t)a) : rd16(0x7e0000 + a); }
-AI void ws16(uint32_t a, uint16_t v) {
-  if (a < 0x10000) wr16_lx(0x7e0000, (uint16_t)a, v);
-  else wr16(0x7e0000 + a, v);
-}
-
 uint32_t R_80e580(uint32_t entry) {
   if (entry != 0x80e580 || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf) return R_80e580_recomp(entry);
+  // The tables are at $7E:8013-$81FF: straight there (bytes: some words are
+  // at odd addresses).
+#ifdef WRAM_DIRECT
+  uint8_t *t = g_wram + 0x8000;
+#define T16(o) ((uint16_t)(t[o] | t[(o) + 1] << 8))
+#define ST16(o, v) (t[o] = (uint8_t)(v), t[(o) + 1] = (uint8_t)((v) >> 8))
+#else
+#define T16(o) rd16(0x7e8000 + (o))
+#define ST16(o, v) wr16(0x7e8000 + (o), (uint16_t)(v))
+#endif
   uint16_t fc = d16(0x2a);
   uint16_t a = fc >> 1;
-  ws16(0x8013, a);
+  ST16(0x13, a);
   a >>= 1;
-  ws16(0x8016, a);
+  ST16(0x16, a);
   a >>= 2;
-  ws16(0x8019, a);
+  ST16(0x19, a);
   a = (uint16_t)(rd16((uint32_t)cpu.db << 16 | 0x17ba) + fc);
   s16(0x36, a);
   uint16_t half = a >> 1;
@@ -345,7 +380,7 @@ uint32_t R_80e580(uint32_t entry) {
   uint16_t y = 0;
   for (int x = 0x100; x >= 0; x -= 0x10) {
     for (int k = 0; k < 8; k++) {
-      ws16(0x802d - 2 * k + x, a);
+      ST16(0x2d - 2 * k + x, a);
       uint32_t r = (uint32_t)a + slope + c;
       a = (uint16_t)r;
       c = (r >> 16) & 1;
@@ -356,12 +391,16 @@ uint32_t R_80e580(uint32_t entry) {
   // PEA $807E; PLB: DB = $7E
   wr8_b0(cpu.s, 0x80);
   wr8_b0((uint16_t)(cpu.s - 1), 0x7e);
-  a = (uint16_t)(((rd16(0x00002a) >> 1) & 0x000e) + 0x90);
+  a = (uint16_t)(((d16(0x2a) >> 1) & 0x000e) + 0x90);
   int16_t x;
-  for (;;) {
+  for (;;) {   // x: $9E-$90 down to $0E-$00
     x = (int16_t)a;
     static const uint8_t kIncs[] = {0x7e, 0x80, 0x82, 0x82, 0x84, 0x84, 0x86, 0x88};
-    for (int k = 0; k < 8; k++) ws16(0x8000 + kIncs[k] + (uint16_t)x, (uint16_t)(w16(0x8000 + kIncs[k] + (uint16_t)x) + 1));
+    for (int k = 0; k < 8; k++) {
+      uint16_t o = (uint16_t)(kIncs[k] + x);
+      uint16_t v = (uint16_t)(T16(o) + 1);
+      ST16(o, v);
+    }
     a = (uint16_t)(x - 0x10);
     if (a & 0x8000) break;
   }
@@ -369,12 +408,15 @@ uint32_t R_80e580(uint32_t entry) {
   for (;;) {
     x = (int16_t)a;
     for (int k = 0; k < 4; k++) {
-      uint32_t ad = 0x801e + 2 * k + (uint16_t)x;
-      ws16(ad, (uint16_t)(w16(ad) + 1));
+      uint16_t o = (uint16_t)(0x1e + 2 * k + x);
+      uint16_t v = (uint16_t)(T16(o) + 1);
+      ST16(o, v);
     }
     a = (uint16_t)(x - 0x10);
     if (a & 0x8000) break;
   }
+#undef T16
+#undef ST16
   // PLB: DB = $80 (the PEA's other byte); RTS
   cpu.db = 0x80;
   cpu.a = a;
@@ -425,33 +467,43 @@ uint32_t R_b5a8da(uint32_t entry) {
   uint32_t db = (uint32_t)cpu.db << 16;
   uint8_t dbk = cpu.db;
   #define KEY(y) ((uint32_t)0x14 + (y) < 0x10000 ? db16(dbk, (uint16_t)(0x14 + (y))) : rd16(db + 0x14 + (y)))
+  // sprite_render_table ($16FC-$172C) and $54: even, in bank 0's WRAM.
+#ifdef WRAM_DIRECT
+#define T(a) (*(const uint16_t *)(g_wram + (a)))
+#define ST(a, v) (*(uint16_t *)(g_wram + (a)) = (v))
+#else
+#define T(a) d16(a)
+#define ST(a, v) s16(a, v)
+#endif
   uint16_t y = db16(dbk, 0x16fe), a = KEY(y);
-  s16(0x54, a);
+  ST(0x54, a);
   uint16_t x = 0x16fc;
   do {
-    y = d16((uint16_t)(0x04 + x));
+    y = T(0x04 + x);
     a = KEY(y);
-    uint16_t last = d16(0x54);
-    s16(0x54, a);
+    uint16_t last = T(0x54);
+    ST(0x54, a);
     if (a > last) {
-      a = d16((uint16_t)(0x02 + x));
-      s16((uint16_t)(0x04 + x), a);
-      s16((uint16_t)(0x02 + x), y);
+      a = T(0x02 + x);
+      ST(0x04 + x, a);
+      ST(0x02 + x, y);
     }
     x += 2;
   } while (x != 0x172c);
   do {
-    y = d16(x);
+    y = T(x);
     a = KEY(y);
-    uint16_t last = d16(0x54);
-    s16(0x54, a);
+    uint16_t last = T(0x54);
+    ST(0x54, a);
     if (a < last) {
-      a = d16((uint16_t)(0x02 + x));
-      s16(x, a);
-      s16((uint16_t)(0x02 + x), y);
+      a = T(0x02 + x);
+      ST(x, a);
+      ST(0x02 + x, y);
     }
     x -= 2;
   } while (x != 0x16fc);
+#undef T
+#undef ST
   // CPX #$16FC: equal; RTL
   cpu.a = a;
   cpu.x = x;
@@ -576,6 +628,18 @@ uint32_t R_b5f5e1(uint32_t entry) {
   }
   // SEP #$10: X and Y 8-bit
   x &= 0xff;
+  // From here the tables' indexes are 8-bit: bank $B5's ROM straight
+  // (rb5) and the high table at $03A0 in WRAM.
+#ifdef WRAM_DIRECT
+  const uint8_t *rb5 = g_rom + (0x35 << 16);
+#define RB5(a) rb5[a]
+#define RB5_16(a) (uint16_t)(rb5[a] | rb5[(a) + 1] << 8)
+#define HIGH_TABLE(k, v) (g_wram[0x03a0 + (k)] = (v))
+#else
+#define RB5(a) rd8(0xb50000 + (a))
+#define RB5_16(a) rd16(0xb50000 + (a))
+#define HIGH_TABLE(k, v) wr8(0xb503a0 + (k), (v))
+#endif
   y = d8(0x32);
   s16(0x3e, (uint16_t)(d16(0x3e) - 1));
   uint32_t p39 = ptr24(0x39);
@@ -595,18 +659,18 @@ uint32_t R_b5f5e1(uint32_t entry) {
         x = pull8();
         if (!x) break;
       }
-      uint32_t tbl = pass ? 0xb5fda8 : 0xb5fca8;
+      uint16_t tbl = pass ? 0xfda8 : 0xfca8;
       do {
         // CODE_B5F696 / CODE_B5F6F9
         c = 0;
-        uint16_t w = adc16v(d16(0x3c), b16(0xfb66 + y), &c, &v);
+        uint16_t w = adc16v(d16(0x3c), RB5_16(0xfb66 + y), &c, &v);
         c = 1;   // SEP #$21
         wram_port((uint8_t)w);
-        wram_port(adc8v(d8(0x3e), rd8(tbl + x), &c, &v));
-        uint8_t t = rd8(tbl + x);
+        uint8_t t = RB5(tbl + x);
+        wram_port(adc8v(d8(0x3e), t, &c, &v));
         c = (t >> 1) & 1;
         t >>= 2;
-        t = adc8v(t, rd8(0xb5fb26 + y), &c, &v);
+        t = adc8v(t, RB5(0xfb26 + y), &c, &v);
         t &= 0x0e;
         t = adc8v(t, d8(0x42), &c, &v);
         t &= 0xee;
@@ -626,7 +690,7 @@ uint32_t R_b5f5e1(uint32_t entry) {
           // A byte of the high table full: stored, every fourth sprite
           push8((uint8_t)x);
           uint8_t k = d8(0x38);
-          wr8(0xb503a0 + k, q);
+          HIGH_TABLE(k, q);
           uint8_t k1 = (uint8_t)(k + 1);
           s8(0x38, k1);
           if (k1 & 0x80) {
@@ -644,7 +708,7 @@ uint32_t R_b5f5e1(uint32_t entry) {
         } else {
           s8(0x4a, q);
         }
-        a = rd16(0xb5fba8 + x);
+        a = RB5_16(0xfba8 + x);
         x = a & 0xff;
       } while (x);
     }

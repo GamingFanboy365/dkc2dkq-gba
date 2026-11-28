@@ -65,7 +65,7 @@ faster), and when it's late a frame's picture is skipped, never two in a
 row (`gba/main.c`): the game runs as fast as its logic allows, the picture
 at half that or more. The cartridge's timing lines say how many VBlanks
 each 60 of the game's frames took (60: full speed); Pirate Panic takes
-about 75, 80% of full speed (84-94 in its busiest stretch).
+about 71, 85% of full speed (80-90 in its busiest stretch).
 
 GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 
@@ -75,7 +75,7 @@ GBA cycles per game frame in Pirate Panic (a GBA frame is 280,896):
 | Before the renderer's rework | 555,000 | 775,000 | 1,330,000 (4.7 frames) |
 | Before HDMA by channel | 293,000 | 276,000 | 569,000 (2.0 frames) |
 | HDMA by channel | 293,000 | 174,000 | 467,000 (1.7 frames) |
-| Now | 245,000 | 174,000 | 419,000 (1.5 frames) |
+| Now | 231,000 | 174,000 | 405,000 (1.4 frames) |
 
 (Measured over game frames 2340-2399 of the play session, in the level,
 with every frame drawn; an earlier "315,000 for drawing" was a quieter
@@ -95,7 +95,9 @@ cycles a frame down to 20,000), the recompiled code as Thumb (half the ROM fetch
 the hottest routines (`src/native.c`: the objects' sprites into OAM, the
 levels' parallax tables, the sort of the objects by drawing order, the
 levels' tiled objects' sprites, the decompressor, which loading and the
-levels' transitions spend their time in, and the unused OAM slots' reset).
+levels' transitions spend their time in, and the unused OAM slots' reset;
+where their addresses are known to be WRAM or ROM, they go straight there,
+which made the parallax tables a third as costly).
 The dispatcher runs from IWRAM with a cache of its recent targets.
 In the generated code, D and DB are locals, and an access whose address is
 constant when they are has a copy for the values the trace saw there;
