@@ -232,6 +232,8 @@ uint32_t interrupt(uint16_t vector_addr, uint32_t resume_pc);
 
 // Polls for an interrupt before a backward branch.
 #define POLL(target16) do { if (EVENT_PENDING()) { SAVE(); return PC_INTR | PBA(target16); } } while (0)
+// The same, storing only the registers given (those that may have changed).
+#define POLLS(target16, save) do { if (EVENT_PENDING()) { save; return PC_INTR | PBA(target16); } } while (0)
 
 // ADC and SBC, binary and decimal; the decimal steps are LakeSnes's
 // (third_party/lakesnes/cpu.c), the reference these are checked against.

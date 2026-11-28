@@ -24,6 +24,7 @@ See src/cpu65.h for the runtime and the shape of the generated code.
 import argparse
 import collections
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -759,18 +760,12 @@ class RegionEmitter:
         for i in entries:
             chk = self.assume(i) or ""
             lines.append(f"    case {hx(i.addr & 0xFFFF)}: {chk} goto L_{i.addr:06x};")
-        lines.append("    default: SAVE(); return PC_STOP | entry;")
+        lines.append("    default: return PC_STOP | entry;")   # (nothing changed yet)
         lines.append("  }")
+        # Each instruction's C: its code, and after it a goto or an exit
+        # when the next instruction isn't emitted next.
+        bodies, tails, cycs = [], [], []
         for k, i in enumerate(region):
-            labels = self.labels_by_addr.get(i.addr)
-            comment = f"  // {i.mnem} {i.mode}" + (f"  [{labels}]" if labels else "")
-            if i.addr in targets or i.addr in self.entries:
-                lines.append(f"L_{i.addr:06x}:")
-            lines.append(comment)
-            if i.assumed and i.addr not in self.entries:
-                chk = self.assume(i)
-                if chk:
-                    lines.append("  " + chk)
             cyc = CYCLES[i.op]
             ctl = self.control(i, region_set)
             body = []
@@ -786,7 +781,7 @@ class RegionEmitter:
                         CONSTS.update(consts)
                         fast = emit_op(i, w)
                         CONSTS.clear()
-                        cond = " && ".join(f"{r} == {hx(k, 4 if r == 'D' else 2)}" for r, k in consts.items())
+                        cond = " && ".join(f"{r} == {hx(k2, 4 if r == 'D' else 2)}" for r, k2 in consts.items())
                         body = [f"if ({cond}) {{"] + ["  " + b for b in fast] + \
                                ["} else {"] + ["  " + b for b in body] + ["}"]
                     if w == 16:
@@ -794,19 +789,98 @@ class RegionEmitter:
                 else:
                     body = [f"if ({cases[0][0]}) {{"] + ["  " + b for b in emit_op(i, 8)] + \
                            ["} else {"] + ["  " + b for b in emit_op(i, 16)] + ["}"]
-            lines.append(f"  CYC({cyc});")
-            lines += ["  " + b for b in body]
+            tail = []
             falls = i.mnem not in NO_FALLTHROUGH and i.mnem != "WAI" and i.mnem not in ("STP", "BRK", "COP")
             emitted_next = region[k + 1].addr if k + 1 < len(region) else None
             if falls and emitted_next != i.next:
                 # The next instruction isn't emitted next: it's elsewhere in
                 # this function (a goto), or in another one.
                 if i.next in region_set:
-                    lines.append(f"  goto L_{i.next:06x};")
+                    tail.append(f"goto L_{i.next:06x};")
                 else:
-                    lines.append(f"  SAVE(); return PBA({hx(i.next & 0xFFFF)});")
+                    tail.append(f"SAVE(); return PBA({hx(i.next & 0xFFFF)});")
+            bodies.append(body)
+            tails.append(tail)
+            cycs.append(cyc)
+        saves = dirty_saves(region, region_set, bodies, tails)
+        for k, i in enumerate(region):
+            labels = self.labels_by_addr.get(i.addr)
+            comment = f"  // {i.mnem} {i.mode}" + (f"  [{labels}]" if labels else "")
+            if i.addr in targets or i.addr in self.entries:
+                lines.append(f"L_{i.addr:06x}:")
+            lines.append(comment)
+            if i.assumed and i.addr not in self.entries:
+                chk = self.assume(i)
+                if chk:
+                    lines.append("  " + chk)
+            lines.append(f"  CYC({cycs[k]});")
+            lines += ["  " + save_regs(b, *saves[k]) for b in bodies[k] + tails[k]]
         lines.append("}")
         return lines
+
+
+# ---- saving only what changed ----
+#
+# The registers are locals while a function runs, and cpu's fields hold them
+# for the others: SAVE() stores them all before a call, a return or an exit.
+# A register not written since the function loaded it (or reloaded it after
+# a call) still equals its field, so only the ones that may have been
+# written need storing: a forward analysis over the function's goto graph.
+
+REG_FIELDS = {"A": "a", "X": "x", "Y": "y", "D": "d", "DB": "db", "fN": "n", "fV": "v", "fZ": "z", "fC": "c"}
+_WRITE_RE = re.compile(r"(?<![\w.>])(A|X|Y|D|DB|fN|fV|fZ|fC)\s*(?:=(?!=)|\+=|-=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
+_ADDR_RE = re.compile(r"&(A|X|Y|D|DB|fN|fV|fZ|fC)\b")
+
+
+def regs_written(code):
+    """The register locals C code may write."""
+    text = "\n".join(code)
+    out = set(_WRITE_RE.findall(text)) | set(_ADDR_RE.findall(text))
+    if "NZ8(" in text or "NZ16(" in text:
+        out |= {"fN", "fZ"}
+    if "SETP(" in text:
+        out |= {"fN", "fV", "fZ", "fC", "X", "Y"}
+    return out
+
+
+def dirty_saves(region, region_set, bodies, tails):
+    """For each instruction: the registers its SAVE()s store (those written
+    since they were loaded, as far as any path to it goes, and by it), and
+    those its POLL()s store (before it)."""
+    n = len(region)
+    index = {i.addr: k for k, i in enumerate(region)}
+    defs = [regs_written(bodies[k] + tails[k]) for k in range(n)]
+    succ = [[] for _ in range(n)]
+    for k, i in enumerate(region):
+        falls = i.mnem not in NO_FALLTHROUGH and i.mnem != "WAI" and i.mnem not in ("STP", "BRK", "COP")
+        if falls and i.next in region_set:
+            succ[k].append(index[i.next])
+        if i.mnem in BRANCHES or (i.mnem in ("JMP", "JML") and i.mode in ("abs", "absl")):
+            t = static_target(i)
+            if t is not None and t in region_set:
+                succ[k].append(index[t])
+    calls = {k for k, i in enumerate(region) if i.mnem in ("JSR", "JSL")}
+    dirty_in = [set() for _ in range(n)]
+    work = list(range(n))
+    while work:
+        k = work.pop()
+        out = set() if k in calls else dirty_in[k] | defs[k]   # (a call reloads them all)
+        for s in succ[k]:
+            if not out <= dirty_in[s]:
+                dirty_in[s] |= out
+                work.append(s)
+    return [(dirty_in[k] | defs[k], dirty_in[k]) for k in range(n)]
+
+
+def save_expr(regs):
+    stores = [f"cpu.{REG_FIELDS[r]} = {r}" for r in REG_FIELDS if r in regs]
+    return "(" + ", ".join(stores) + ")" if stores else "(void)0"
+
+
+def save_regs(line, at_exit, before):
+    """line with SAVE() and POLL() storing only the registers given."""
+    line = line.replace("SAVE()", save_expr(at_exit))
+    return re.sub(r"POLL\((0x[0-9a-fA-F]+)\)", lambda m: f"POLLS({m.group(1)}, {save_expr(before)})", line)
 
 
 def main():
