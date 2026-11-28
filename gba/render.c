@@ -865,6 +865,8 @@ IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, 
   int num_made = 0;
   uint32_t next = 0;
   int top = g_view_top, bottom = g_view_top + g_view_lines;
+  extern uint8_t g_hud_slots;   // (src/native.c)
+  int hud = g_hud_slots;
   for (int i = 0; i < 128; i++) {
     uint16_t w0 = g_hw.oam[i * 2], w1 = g_hw.oam[i * 2 + 1];
     uint8_t high = (g_hw.high_oam[i >> 2] >> ((i & 3) * 2)) & 3;
@@ -873,6 +875,9 @@ IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, 
     if (x >= 256) x -= 512;
     int y = w0 >> 8;
     if (y >= 224) y -= 256;   // the SNES wraps at the bottom of its 256 lines
+    // The HUD: where it is on the SNES's screen, whatever lines the view
+    // shows (as if it began at line 0).
+    if (i < hud && y < 224 - top) y += top;
     int gx = x - CROP_X;
     uint16_t *o = &f->oam[i * 4];
     int y0 = y < top ? top : y, y1 = y + size > bottom ? bottom : y + size;

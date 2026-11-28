@@ -6,7 +6,7 @@ ENTRY(_start)
 
 MEMORY {
   rom   (rx)  : ORIGIN = 0x08000000, LENGTH = 32M
-  iwram (rwx) : ORIGIN = 0x03000000, LENGTH = 0x7500   /* the rest (2.5 KB, twice the deepest seen): stacks */
+  iwram (rwx) : ORIGIN = 0x03000000, LENGTH = 0x7540   /* the rest (2.4 KB, nearly twice the deepest seen): stacks */
   ewram (rw)  : ORIGIN = 0x02000000, LENGTH = 256K
 }
 

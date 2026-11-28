@@ -327,7 +327,16 @@ static void b59f40_body(void) {
   }
 }
 
+// The OAM slots written before the objects' (from $0200 to $70's value as
+// this starts): the HUD's (the banana counter, the lives), fixed on the
+// screen. The GBA's renderer keeps them at the top of its cropped view.
+uint8_t g_hud_slots;
+
 uint32_t R_b59f40(uint32_t entry) {
+  {
+    uint16_t o = d16(0x70);
+    g_hud_slots = o >= 0x200 && o <= 0x400 ? (uint8_t)((o - 0x200) >> 2) : 0;
+  }
   if (entry != 0xb59f40 || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf) return R_b59f40_recomp(entry);
   b59f40_body();
   // PEA $8080; PLB; PLB; RTL
