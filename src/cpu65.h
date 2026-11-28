@@ -42,6 +42,9 @@ typedef uint32_t (*RegionFn)(uint32_t entry);
 // rd8, wr8 (the SNES's memory map), rd8_b0, wr8_b0 (bank 0), CYC(n),
 // EVENT_PENDING(), ASSUME_MX(m, x, pc).
 #include "platform_cpu.h"
+#ifndef WARM_CODE
+#define WARM_CODE   // (fast memory, small code, where the platform has it)
+#endif
 
 static inline __attribute__((always_inline)) uint16_t rd16(uint32_t a) {
 #ifdef WRAM_DIRECT

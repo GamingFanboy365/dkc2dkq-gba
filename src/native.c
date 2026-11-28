@@ -444,7 +444,7 @@ uint32_t R_80e580(uint32_t entry) {
 // PHK; PLB; then $F0FF (X 255, Y 240) into each slot's first word from X =
 // [$70] to $400, by 4; RTS. Every frame, 100-odd slots.
 
-uint32_t R_8088ba(uint32_t entry) {
+WARM_CODE uint32_t R_8088ba(uint32_t entry) {
   if (entry != 0x8088ba || cpu.d != 0 || cpu.e || cpu.mf || cpu.xf) return R_8088ba_recomp(entry);
   uint16_t x = d16(0x70);
   if (x > 0x400 || (x & 3)) return R_8088ba_recomp(entry);   // (never: the loop would run on)

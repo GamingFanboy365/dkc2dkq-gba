@@ -19,7 +19,7 @@ static inline uint32_t canonical(uint32_t pc) {
 extern const uint8_t g_entry_bank_slot[256];
 extern const uint16_t g_entry_page_start[][257];
 
-RegionFn lookup_entry(uint32_t pc) {
+WARM_CODE RegionFn lookup_entry(uint32_t pc) {
   uint32_t key = canonical(pc);
   uint32_t slot = g_entry_bank_slot[key >> 16];
   if (slot == 0xff) return 0;
@@ -52,9 +52,6 @@ static inline RegionFn cached_entry(uint32_t pc) {
   return fn;
 }
 
-#ifndef WARM_CODE
-#define WARM_CODE
-#endif
 // (In fast memory on the GBA: from ROM, a lookup was ~350 cycles.)
 WARM_CODE uint32_t dispatch(uint32_t pc) {
   RegionFn fn = cached_entry(pc);
