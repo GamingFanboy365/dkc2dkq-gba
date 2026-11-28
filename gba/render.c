@@ -50,6 +50,7 @@ static int g_view_top = -1, g_view_lines;
 static uint8_t g_src_line[LINES];
 static uint8_t g_line_used[224];        // per SNES line: shown
 static uint8_t g_first_gba_line[225];   // per SNES line: the first GBA line showing it or one below
+static uint8_t g_view_period;           // the SNES lines after which the view's pattern of lines repeats
 
 // a / b (there's no division in this build's C library); rarely called.
 static uint32_t udiv(uint32_t a, uint32_t b) {
@@ -76,6 +77,12 @@ void render_set_view(int top, int lines) {
     while (g < LINES && g_src_line[g] < sy) g++;
     g_first_gba_line[sy] = (uint8_t)g;
   }
+  // lines / gcd(lines, LINES): 184 lines in 160, every 23.
+  uint32_t a = (uint32_t)lines, b = LINES;
+  while (b) { while (a >= b) a -= b; uint32_t t = a; a = b; b = t; }
+  uint32_t p = 0;
+  for (uint32_t l = (uint32_t)lines; l >= a; l -= a) p++;
+  g_view_period = (uint8_t)p;
 }
 
 #define BG_VRAM ((volatile uint8_t *)0x06000000)
@@ -860,10 +867,35 @@ IWRAM_CODE static void make_obj_picture(volatile uint32_t *dst, uint32_t t, int 
   }
 }
 
+// Whether any of a sprite's tiles in VRAM was written since the last
+// picture (g_vram_changed: a bit per 8 words, a 4bpp tile two).
+__attribute__((noinline)) static bool obj_tiles_changed(uint32_t t, int tiles_w, int tiles_h, uint32_t base,
+                                                        uint32_t gap) {
+  uint32_t table = t & 0x100 ? base + gap : base;
+  for (int r = 0; r < tiles_h; r++) {
+    uint32_t trow = (((t >> 4) + (uint32_t)r) & 15) << 4;
+    for (int c = 0; c < tiles_w; c++) {
+      uint32_t k = ((table + (trow | ((t + (uint32_t)c) & 15)) * 16) & 0x7fff) >> 3;
+      if ((g_vram_changed[k >> 5] >> (k & 31)) & 3) return true;
+    }
+  }
+  return false;
+}
+
+// The pictures of the last two frames (one per half of OBJ VRAM): a picture
+// the frame before made, of tiles not written since, is copied, not made.
+#define MAX_PICTURES 64
+EWRAM_DATA static ObjPicture g_made[2][MAX_PICTURES];
+EWRAM_DATA static uint8_t g_num_made[2];
+EWRAM_DATA static uint32_t g_made_for[2];   // the view and OBJ setting they were made for
+
 IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, uint32_t gap, uint8_t obsel) {
-  EWRAM_DATA static ObjPicture made[128];
-  int num_made = 0;
+  ObjPicture *made = g_made[half], *prev = g_made[half ^ 1];
+  uint32_t made_for = (uint32_t)g_view_lines | (uint32_t)obsel << 8;   // (OBSEL: the tiles' base, gap, sizes)
+  int num_made = 0, num_prev = g_made_for[half ^ 1] == made_for ? g_num_made[half ^ 1] : 0;
+  g_made_for[half] = made_for;
   uint32_t next = 0;
+  uint32_t period = g_view_period;
   int top = g_view_top, bottom = g_view_top + g_view_lines;
   extern uint8_t g_hud_slots;   // (src/native.c)
   int hud = g_hud_slots;
@@ -900,7 +932,18 @@ IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, 
     // Sprites of priority 2 lose pixels to BG1's and BG2's priority tiles
     // (kObjPriority): their pictures depend on X too.
     uint32_t behind = ((attr >> 4) & 3) == 2 && (g_hw.regs[0x05] & 7) == 1 ? 3 : 0;
-    uint32_t key = t | (uint32_t)vflip << 9 | (uint32_t)(size >> 3) << 10 | (uint32_t)(y & 0x1ff) << 14;
+    // Its lines: those of where it is in the view's pattern of lines, when
+    // it's all in the view (y - top, modulo the pattern's period); else of
+    // its place, the view's top too.
+    uint32_t ykey;
+    if (y >= top && y + size <= bottom) {
+      uint32_t d = (uint32_t)(y - top);
+      while (d >= period) d -= period;
+      ykey = 0x80000000u | d << 14;
+    } else {
+      ykey = (uint32_t)(y & 0x1ff) << 14 | (uint32_t)top << 23;
+    }
+    uint32_t key = t | (uint32_t)vflip << 9 | (uint32_t)(size >> 3) << 10 | ykey;
     uint16_t xkey = behind ? (uint16_t)(((x + 1) & 0x3ff) | (attr & 0x40) << 4) : 0;
     uint32_t tile = 0xffff;
     for (int m = 0; m < num_made; m++)
@@ -914,17 +957,31 @@ IWRAM_CODE static void draw_sprites_squeezed(Frame *f, int half, uint32_t base, 
       }
       tile = (uint32_t)half * OBJ_HALF_TILES + next;
       next += count;
-      make_obj_picture(OBJ_VRAM + tile * 8, t, size, tiles_w, tiles_h, y, g0, n, vflip, base, gap, behind, x,
-                       attr & 0x40);
-      made[num_made].key = key;
-      made[num_made].tile = (uint16_t)tile;
-      made[num_made].x = xkey;
-      num_made++;
+      // Made the frame before (not one BGs cover: they may have moved)?
+      int from = -1;
+      if (!behind)
+        for (int m = 0; m < num_prev; m++)
+          if (prev[m].key == key && prev[m].x == 0) { from = prev[m].tile; break; }
+      if (from >= 0 && !obj_tiles_changed(t, tiles_w, size >> 3, base, gap)) {
+        *(volatile uint32_t *)0x040000d4 = (uint32_t)(OBJ_VRAM + from * 8);   // DMA 3: 32-bit words, now
+        *(volatile uint32_t *)0x040000d8 = (uint32_t)(OBJ_VRAM + tile * 8);
+        *(volatile uint32_t *)0x040000dc = count * 8 | 0x84000000u;
+      } else {
+        make_obj_picture(OBJ_VRAM + tile * 8, t, size, tiles_w, tiles_h, y, g0, n, vflip, base, gap, behind, x,
+                         attr & 0x40);
+      }
+      if (num_made < MAX_PICTURES) {
+        made[num_made].key = key;
+        made[num_made].tile = (uint16_t)tile;
+        made[num_made].x = xkey;
+        num_made++;
+      }
     }
     o[0] = (uint16_t)((g0 & 0xff) | shape << 14);
     o[1] = (uint16_t)((gx & 0x1ff) | (attr & 0x40) << 6 | gsize << 14);
     o[2] = (uint16_t)(tile | kObjPriority[(attr >> 4) & 3] << 10 | ((attr >> 1) & 7) << 12);
   }
+  g_num_made[half] = (uint8_t)num_made;
 }
 
 __attribute__((noinline)) static void draw_sprites(Frame *f) {
@@ -1005,6 +1062,35 @@ void render_init(void) {
 }
 
 uint32_t g_render_cycles, g_idle_cycles;
+
+// The palette, when CGRAM or the brightness changed since this buffer's
+// (rare in the levels: from ROM).
+__attribute__((noinline)) static void make_palette(Frame *f, uint32_t palette_key, int bright, bool all_colors) {
+  f->palette_key = palette_key;
+  if (all_colors) {
+    for (int i = 0; i < 256; i++) f->palette[i] = scale_color(g_hw.cgram[i], bright);
+  } else {
+    for (int i = 0; i < 128; i++) f->palette[i] = scale_color(g_hw.cgram[i], bright);
+    for (int p = 0; p < 8; p++)
+      for (int c = 0; c < 4; c++) f->palette[(8 + p) * 16 + c] = scale_color(g_hw.cgram[p * 4 + c], bright);
+  }
+  for (int i = 0; i < 128; i++) f->palette[256 + i] = scale_color(g_hw.cgram[128 + i], bright);
+}
+
+// The colors HDMA rewrites line by line (the map screens; from ROM).
+__attribute__((noinline)) static void make_line_colors(Frame *f, int bright) {
+  for (int k = 0; k < g_num_hdma_colors; k++) {
+    uint16_t idx[2] = {0, 0};
+    int n = gba_entries(g_hdma_color[k], idx);
+    f->pal_index[k][0] = idx[0];
+    f->pal_index[k][1] = n > 1 ? idx[1] : 0;
+    for (int gy = 0; gy < LINES; gy++) f->line_pal[gy][k] = scale_color(g_line_color[g_src_line[gy]][k], bright);
+    for (int j = 0; j < n; j++) f->palette[idx[j]] = f->line_pal[0][k];
+    if (!f->per_line_regs)
+      for (int gy = 1; gy < LINES; gy++)
+        if (f->line_pal[gy][k] != f->line_pal[0][k]) { f->per_line_regs = true; break; }
+  }
+}
 
 IWRAM_CODE void render_frame(void) {
   // The game may finish frames faster than the GBA shows them: wait for the
@@ -1270,32 +1356,10 @@ IWRAM_CODE void render_frame(void) {
   // In Modes 3 and 7 the backgrounds' colors are all 256.
   bool all_colors = mode == 7 || mode == 3;
   uint32_t palette_key = (uint32_t)g_hw.cgram_ver << 5 | (uint32_t)all_colors << 4 | bright;
-  if (f->palette_key != palette_key) {
-    f->palette_key = palette_key;
-    if (all_colors) {
-      for (int i = 0; i < 256; i++) f->palette[i] = scale_color(g_hw.cgram[i], bright);
-    } else {
-      for (int i = 0; i < 128; i++) f->palette[i] = scale_color(g_hw.cgram[i], bright);
-      for (int p = 0; p < 8; p++)
-        for (int c = 0; c < 4; c++) f->palette[(8 + p) * 16 + c] = scale_color(g_hw.cgram[p * 4 + c], bright);
-    }
-    for (int i = 0; i < 128; i++) f->palette[256 + i] = scale_color(g_hw.cgram[128 + i], bright);
-  }
+  if (f->palette_key != palette_key) make_palette(f, palette_key, bright, all_colors);
   if (!all_colors) f->palette[255] = f->fixed[0];
-
-  // The colors HDMA rewrites: line 0's in the palette, the rest by line.
   f->num_line_colors = (uint8_t)g_num_hdma_colors;
-  for (int k = 0; k < g_num_hdma_colors; k++) {
-    uint16_t idx[2] = {0, 0};
-    int n = gba_entries(g_hdma_color[k], idx);
-    f->pal_index[k][0] = idx[0];
-    f->pal_index[k][1] = n > 1 ? idx[1] : 0;
-    for (int gy = 0; gy < LINES; gy++) f->line_pal[gy][k] = scale_color(g_line_color[g_src_line[gy]][k], bright);
-    for (int j = 0; j < n; j++) f->palette[idx[j]] = f->line_pal[0][k];
-    if (!f->per_line_regs)
-      for (int gy = 1; gy < LINES; gy++)
-        if (f->line_pal[gy][k] != f->line_pal[0][k]) { f->per_line_regs = true; break; }
-  }
+  if (g_num_hdma_colors) make_line_colors(f, bright);
   // The palette is remade when CGRAM changes; these entries were changed
   // in it for this frame only.
   if (f->num_line_colors) f->palette_key = NO_KEY;
